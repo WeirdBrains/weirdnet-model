@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-18
+
 ### Added
 
 - Model catalog with Gemma 4 E2B and E4B GGUF defaults, a model store, and consent-gated Hugging Face downloads with resume, progress and SHA-256 verification.
