@@ -1,0 +1,43 @@
+[package]
+name = "weirdnet-model"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Weirdnet local models: Hugging Face GGUF download with resume and checksum, a Gemma 4 catalog, streaming llama.cpp inference on a worker thread with cancel, and an optional weirdnet-agent ModelBackend."
+authors = ["m3talsmith <m3talsmith@gmail.com>"]
+license = "BSD-3-Clause"
+repository = "https://github.com/WeirdBrains/weirdnet-model"
+documentation = "https://docs.rs/weirdnet-model"
+readme = "README.md"
+keywords = ["llm", "gguf", "llama-cpp", "huggingface", "weirdnet"]
+categories = ["api-bindings", "science"]
+include = ["src/**", "README.md", "CHANGELOG.md", "LICENSE"]
+
+[features]
+default = []
+# llama.cpp inference (CPU). Needs cmake and a C++ compiler to build.
+llama = ["dep:llama-cpp-2"]
+# GPU backends for llama.cpp.
+vulkan = ["llama", "llama-cpp-2/vulkan"]
+metal = ["llama", "llama-cpp-2/metal"]
+# `weirdnet_agent::ModelBackend` over the worker.
+agent = ["dep:weirdnet-agent", "dep:async-trait"]
+
+[dependencies]
+dirs = "6"
+minijinja = { version = "3", features = ["json", "loop_controls"] }
+minijinja-contrib = { version = "3", features = ["pycompat"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+ureq = "3"
+
+async-trait = { version = "0.1", optional = true }
+llama-cpp-2 = { version = "0.1.161", default-features = false, features = ["sampler"], optional = true }
+weirdnet-agent = { version = "0.1.0", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }

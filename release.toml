@@ -1,0 +1,33 @@
+# weirdnet-model release config for weirdnet-project-helpers (scripts/weirdnet_release.py).
+# Usage: python3 scripts/weirdnet_release.py [--patch|--major|--version X.Y.Z] [--dry-run]
+# Notes come from CHANGELOG.md `## [Unreleased]`; a message is optional.
+helpers = "0.3.2"
+project = "weirdnet-model"
+next = ["docs.rs builds https://docs.rs/weirdnet-model/{version} from the crates.io upload"]
+
+[env]
+CARGO_TARGET_DIR = "/path/to/scratch/scratch/weirdnet-model/cargo-target"
+
+[[files]]
+kind = "cargo-package"
+paths = ["Cargo.toml"]
+primary = true
+
+[[files]]
+kind = "cargo-lock"
+path = "Cargo.lock"
+packages = ["weirdnet-model"]
+
+[changelog]
+path = "CHANGELOG.md"
+
+[checks]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --all-targets --features llama,agent -- -D warnings",
+  "cargo test --features llama,agent",
+  "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --features llama,agent",
+]
+
+[crates]
+publish = ["."]

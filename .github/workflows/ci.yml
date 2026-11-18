@@ -1,0 +1,24 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo test --locked --no-default-features --features agent
+      # llama.cpp builds from source (cmake and g++ ship on the runner). Vulkan and Metal are not built here.
+      - run: cargo clippy --locked --all-targets --features llama,agent -- -D warnings
+      - run: cargo test --locked --features llama,agent
+      - run: RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --features llama,agent
+      - run: cargo package --locked
