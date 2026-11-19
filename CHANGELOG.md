@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-19
+
 ### Added
 
 - `hw` module (from Ymir's `ymir-hw`): `detect()` finds NVIDIA (`nvidia-smi`), AMD (sysfs) and Apple silicon GPUs, CPU threads and system memory (Linux, Android, macOS, BSD, Windows); `budget()` gives the memory models may use; `catalog()`/`find()` list tiered chat and embedding models with footprints; `plan()` picks a main model, a stand-in and an embedding model that fit.
