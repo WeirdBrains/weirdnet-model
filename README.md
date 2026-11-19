@@ -18,14 +18,32 @@ cancel. App-agnostic; the model is optional at build time.
 - `cpu-dispatch` feature: llama.cpp built for every CPU level and picked at run time (see below).
 - `cpu`: whether this CPU can run the compiled-in llama.cpp. Loading a model checks it first.
 - `agent` feature: `agent::LocalModel` implements `weirdnet_agent::ModelBackend`, so the agent
-  loop can run on a local model with streamed text and parsed tool calls.
+  loop can run on a local model with streamed text and parsed tool calls (`weirdnet-agent` 0.4).
+- `hw`: hardware detection and model sizing (see below).
 
 ```toml
-weirdnet-model = { version = "0.2", features = ["llama", "agent"] }
+weirdnet-model = { version = "0.4", features = ["llama", "agent"] }
 ```
 
 Tests never download a model. `WEIRDNET_TEST_GGUF=/path/model.gguf cargo test --features llama -- --ignored`
 runs the real-model check.
+
+## Hardware and sizing
+
+`hw::detect()` reports the OS, CPU threads, system memory and GPUs: NVIDIA through `nvidia-smi`,
+AMD through sysfs, and Apple silicon. Devices that share system memory (Apple, GB10, AMD APUs) are
+marked unified. It never fails; a missing tool means fewer devices.
+
+`hw::budget(&hw, memory_budget, reserve)` is the memory models may use: 85% of VRAM, or of
+unified memory after an OS reserve; both can be overridden. `hw::plan(&hw, budget)` picks a main
+chat model, a smaller stand-in and an embedding model from `hw::catalog()`, a tiered catalog with
+each model's footprint; the Gemma entries are this crate's pinned `ModelSpec`s, so they download
+through the consent gate.
+
+```rust
+let hw = weirdnet_model::hw::detect();
+let plan = weirdnet_model::hw::plan(&hw, weirdnet_model::hw::budget(&hw, None, None));
+```
 
 ## CPU support
 

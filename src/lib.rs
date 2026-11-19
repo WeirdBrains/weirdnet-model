@@ -8,6 +8,8 @@
 //!   tag format for tools (prompt text and a streaming parser).
 //! - [`worker`]: an [`Engine`] on its own thread, streaming text with cancel.
 //! - [`cpu`]: whether this CPU can run the compiled-in llama.cpp (checked before it loads).
+//! - [`hw`]: what accelerators and memory this machine has, the memory budget for models, a
+//!   tiered catalog with footprints, and [`hw::plan`] to pick models that fit.
 //! - `llama` (feature): the llama.cpp [`Engine`].
 //! - `agent` (feature): `weirdnet_agent::ModelBackend` over the worker.
 //!
@@ -18,6 +20,7 @@ pub mod catalog;
 pub mod cpu;
 pub mod download;
 pub mod hf;
+pub mod hw;
 pub mod prompt;
 pub mod store;
 #[cfg(test)]

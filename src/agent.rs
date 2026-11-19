@@ -59,6 +59,8 @@ pub fn turns(messages: &[Message], tools: &[ToolSpec]) -> Vec<ChatMessage> {
                     .unwrap_or("tool");
                 out.push(ChatMessage::new(ChatRole::User, prompt::result_text(name, &m.content, false)));
             }
+            // Roles added to `weirdnet_agent::Role` later are not sent to the model.
+            _ => {}
         }
     }
     out

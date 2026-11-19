@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `hw` module (from Ymir's `ymir-hw`): `detect()` finds NVIDIA (`nvidia-smi`), AMD (sysfs) and Apple silicon GPUs, CPU threads and system memory (Linux, Android, macOS, BSD, Windows); `budget()` gives the memory models may use; `catalog()`/`find()` list tiered chat and embedding models with footprints; `plan()` picks a main model, a stand-in and an embedding model that fit.
+
+### Changed
+
+- **Breaking for `agent` users:** the `agent` feature now depends on `weirdnet-agent` `=0.4.0` (was `=0.3.0`). `ModelBackend` is unchanged; roles added later to the now non-exhaustive `Role` are not sent to the model.
+
 ## [0.3.0] - 2026-11-19
 
 ### Changed
