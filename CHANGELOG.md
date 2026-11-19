@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-19
+
 ### Changed
 
 - **Breaking for `agent` users:** the `agent` feature now depends on `weirdnet-agent` `=0.3.0` (was `=0.2.0`), so `LocalModel` implements the 0.3.0 `ModelBackend`. `ModelBackend` itself is unchanged and no source changes were needed.
