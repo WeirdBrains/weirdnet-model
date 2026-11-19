@@ -1,5 +1,6 @@
 //! A small CLI over the crate: `fetch [id]` downloads (consent is the command itself) with
-//! progress; `chat [id] "question"` loads the model and streams the answer with timings.
+//! progress; `chat [id] "question"` loads the model and streams the answer with timings; `cpu`
+//! says whether this CPU can run the build's llama.cpp.
 //!
 //!     cargo run --release --example model --features llama -- fetch gemma-4-e4b
 //!     cargo run --release --example model --features llama -- chat gemma-4-e4b "Why is the sky blue?"
@@ -50,12 +51,24 @@ fn main() {
                         std::io::stdout().flush().ok();
                     }
                     Chunk::Done(s) => println!("\n[stats {s:?}]"),
-                    Chunk::Failed(e) => panic!("{e}"),
+                    Chunk::Failed(e) => {
+                        eprintln!("\nfailed: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
             let total = t0.elapsed();
             println!("[load+first-chunk {:?}, total {:?}, {n} chunks]", first.unwrap_or_default(), total);
         }
-        _ => eprintln!("usage: model fetch|chat [id] [question]"),
+        "cpu" => {
+            // Safe on any CPU: says whether this build's llama.cpp can run here, without running it.
+            println!("required: {:?}", weirdnet_model::cpu::required());
+            println!("{}", weirdnet_model::llama::describe());
+            match weirdnet_model::cpu::check() {
+                Ok(()) => println!("this CPU can run local models"),
+                Err(e) => println!("refused: {e}"),
+            }
+        }
+        _ => eprintln!("usage: model fetch|chat|cpu [id] [question]"),
     }
 }

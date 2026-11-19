@@ -7,6 +7,7 @@
 //! - [`prompt`]: render chat turns with the model's own Jinja template, and the `<tool_call>`
 //!   tag format for tools (prompt text and a streaming parser).
 //! - [`worker`]: an [`Engine`] on its own thread, streaming text with cancel.
+//! - [`cpu`]: whether this CPU can run the compiled-in llama.cpp (checked before it loads).
 //! - `llama` (feature): the llama.cpp [`Engine`].
 //! - `agent` (feature): `weirdnet_agent::ModelBackend` over the worker.
 //!
@@ -14,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod catalog;
+pub mod cpu;
 pub mod download;
 pub mod hf;
 pub mod prompt;
@@ -52,6 +54,9 @@ pub enum Error {
     BadRepo(String),
     #[error("{0}")]
     Model(String),
+    /// This CPU lacks instructions the compiled-in llama.cpp uses; see [`cpu`].
+    #[error("local models need CPU instructions this one lacks: {}", missing.join(", "))]
+    UnsupportedCpu { missing: Vec<String> },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

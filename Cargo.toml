@@ -11,7 +11,7 @@ documentation = "https://docs.rs/weirdnet-model"
 readme = "README.md"
 keywords = ["llm", "gguf", "llama-cpp", "huggingface", "weirdnet"]
 categories = ["api-bindings", "science"]
-include = ["src/**", "README.md", "CHANGELOG.md", "LICENSE"]
+include = ["build.rs", "src/**", "README.md", "CHANGELOG.md", "LICENSE"]
 
 [features]
 default = []

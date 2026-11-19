@@ -21,7 +21,10 @@ pub const DEFAULT_CONTEXT: u32 = 8192;
 pub const DEFAULT_MAX_TOKENS: u32 = 1024;
 const BATCH: usize = 512;
 
+/// The process-wide llama.cpp backend. Checks the CPU first ([`crate::cpu::check`]): on a CPU
+/// without the instructions this build's ggml was compiled with, llama.cpp must never run.
 fn backend() -> Result<&'static LlamaBackend> {
+    crate::cpu::check()?;
     static B: OnceLock<std::result::Result<LlamaBackend, String>> = OnceLock::new();
     B.get_or_init(|| {
         LlamaBackend::init()
@@ -56,6 +59,9 @@ pub struct LlamaEngine {
 
 /// `llama.cpp (Vulkan)`, `(Metal)` or `(CPU)`, for a settings line.
 pub fn describe() -> String {
+    if crate::cpu::check().is_err() {
+        return "llama.cpp (unsupported CPU)".into();
+    }
     let gpu = backend().map(|b| b.supports_gpu_offload()).unwrap_or(false);
     format!("llama.cpp ({})", if gpu { if cfg!(target_os = "macos") { "Metal" } else { "GPU" } } else { "CPU" })
 }
@@ -65,6 +71,8 @@ fn model_err(what: &str, e: impl std::fmt::Display) -> Error {
 }
 
 impl LlamaEngine {
+    /// Loads `path`. Fails with [`Error::UnsupportedCpu`] before touching llama.cpp when this CPU
+    /// can't run it.
     pub fn load(path: &Path, opts: LlamaOptions) -> Result<Self> {
         let b = backend()?;
         let params = LlamaModelParams::default().with_n_gpu_layers(opts.gpu_layers);
