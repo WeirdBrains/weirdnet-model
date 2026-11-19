@@ -6,7 +6,7 @@ cancel. App-agnostic; the model is optional at build time.
 
 - `catalog`: Gemma 4 E2B (phones, small laptops) and E4B (desktop) GGUF defaults, with repo, file,
   size and checksum. `catalog::default_for(Device)` picks one.
-- `ModelStore`, `download`: a cache directory (`WEIRDNET_MODEL_DIR` overrides it), a `Consent` the
+- `ModelStore`, `download`: a cache directory (`WEIRDNET_MODELS_DIR` overrides it), a `Consent` the
   user must give for exactly that model, `Progress` callbacks, `.part` resume and verification.
 - `hf`: list a repo's GGUF files and sizes for a model picker.
 - `prompt`: chat turns rendered through the model's own chat template, and a streaming parser that

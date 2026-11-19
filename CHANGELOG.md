@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `examples/model.rs`: `fetch` and `chat` commands with timings.
+
+### Fixed
+
+- README named the cache override `WEIRDNET_MODEL_DIR`; the variable is `WEIRDNET_MODELS_DIR`.
+
 ## [0.1.0] - 2026-11-18
 
 ### Added

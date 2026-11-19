@@ -41,3 +41,7 @@ weirdnet-agent = { version = "0.1.0", optional = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
+
+[[example]]
+name = "model"
+required-features = ["llama"]
