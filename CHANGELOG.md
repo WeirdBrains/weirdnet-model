@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-19
+
 ### Changed
 
 - The `agent` feature now depends on `weirdnet-agent` `=0.2.0` (was `^0.1`). `ModelBackend` is unchanged, so apps on agent 0.2 can use `LocalModel`.

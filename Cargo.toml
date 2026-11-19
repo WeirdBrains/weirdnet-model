@@ -1,6 +1,6 @@
 [package]
 name = "weirdnet-model"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.99"
 description = "Weirdnet local models: Hugging Face GGUF download with resume and checksum, a Gemma 4 catalog, streaming llama.cpp inference on a worker thread with cancel, and an optional weirdnet-agent ModelBackend."
