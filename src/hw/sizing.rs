@@ -224,7 +224,7 @@ pub fn plan(hw: &Hardware, budget: Budget) -> Plan {
         notes.push("CPU only: limited to models with at most 4B active parameters".into());
     }
     if main.is_none() {
-        notes.push("no catalog chat model fits; add a smaller GGUF with `ymirctl setup --model PATH`".into());
+        notes.push("no catalog chat model fits this budget; add a smaller GGUF model".into());
     }
     let standin_id = if budget.usable_bytes >= 16 * GIB { crate::catalog::GEMMA_4_E4B } else { crate::catalog::GEMMA_4_E2B };
     let standin = all.iter().find(|e| e.spec.id == standin_id).filter(fits).filter(|e| main.as_ref().is_none_or(|m| m.spec.id != e.spec.id)).cloned();
