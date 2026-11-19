@@ -21,7 +21,7 @@ cancel. App-agnostic; the model is optional at build time.
   loop can run on a local model with streamed text and parsed tool calls.
 
 ```toml
-weirdnet-model = { version = "0.1", features = ["llama", "agent"] }
+weirdnet-model = { version = "0.2", features = ["llama", "agent"] }
 ```
 
 Tests never download a model. `WEIRDNET_TEST_GGUF=/path/model.gguf cargo test --features llama -- --ignored`
