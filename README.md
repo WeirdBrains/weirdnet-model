@@ -63,6 +63,12 @@ On x86-64 Linux (llama-cpp-sys-2 0.1.161, release, stripped) that is a 4.3 MB ex
 shared libraries (11 MB) and 14 CPU libraries (20 MB), 35 MB in all, against 9.4 MB for the static
 example. Ship the versioned names the executable asks for (`libllama.so.0` and so on).
 
+`llama-cpp-sys-2` 0.1.161's shared-library build does not work with Rust 1.100's build directory
+layout (its build script fails with "No such file or directory"), so build `cpu-dispatch` with Rust
+1.99 for now. A second build in the same target directory can also fail with "File exists" on the
+library symlinks it left there; deleting `target/<profile>/{,deps/,examples/}lib*.so*` symlinks
+between builds avoids it. The static `llama` build has neither problem.
+
 Without `cpu-dispatch`, a static build can still run everywhere at a speed cost by building ggml
 for an older level, for example `GGML_AVX=OFF GGML_AVX2=OFF GGML_BMI2=OFF GGML_FMA=OFF
 GGML_F16C=OFF` in the build environment (SSE4.2, Nehalem and later). The guard follows those
