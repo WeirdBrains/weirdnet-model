@@ -57,6 +57,9 @@ pub enum Error {
     /// This CPU lacks instructions the compiled-in llama.cpp uses; see [`cpu`].
     #[error("local models need CPU instructions this one lacks: {}", missing.join(", "))]
     UnsupportedCpu { missing: Vec<String> },
+    /// `cpu-dispatch` builds: no llama.cpp CPU backend library could be loaded.
+    #[error("no llama.cpp CPU backend found in {} (ship the ggml-cpu libraries there)", dir.display())]
+    NoCpuBackend { dir: std::path::PathBuf },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

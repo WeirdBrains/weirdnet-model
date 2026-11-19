@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn the_requirement_matches_the_features() {
         let r = required();
-        if !cfg!(feature = "llama") || !cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
+        if !cfg!(feature = "llama") || cfg!(feature = "cpu-dispatch") || !cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
             assert!(r.is_empty(), "{r:?}");
         }
         for f in &r {

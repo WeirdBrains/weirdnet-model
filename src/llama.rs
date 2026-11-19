@@ -26,7 +26,14 @@ const BATCH: usize = 512;
 fn backend() -> Result<&'static LlamaBackend> {
     crate::cpu::check()?;
     static B: OnceLock<std::result::Result<LlamaBackend, String>> = OnceLock::new();
+    #[cfg(feature = "cpu-dispatch")]
+    static NO_CPU: OnceLock<std::path::PathBuf> = OnceLock::new();
     B.get_or_init(|| {
+        #[cfg(feature = "cpu-dispatch")]
+        if let Err(dir) = dispatch::load() {
+            NO_CPU.set(dir).ok();
+            return Err(String::new());
+        }
         LlamaBackend::init()
             .map(|mut b| {
                 b.void_logs();
@@ -35,7 +42,96 @@ fn backend() -> Result<&'static LlamaBackend> {
             .map_err(|e| e.to_string())
     })
     .as_ref()
-    .map_err(|e| Error::Model(format!("llama.cpp: {e}")))
+    .map_err(|e| {
+        #[cfg(feature = "cpu-dispatch")]
+        if let Some(dir) = NO_CPU.get() {
+            return Error::NoCpuBackend { dir: dir.clone() };
+        }
+        Error::Model(format!("llama.cpp: {e}"))
+    })
+}
+
+#[cfg(feature = "cpu-dispatch")]
+pub use dispatch::{backends_dir, set_backends_dir};
+
+/// `cpu-dispatch`: ggml's backends (one CPU library per CPU level, plus GPU ones) are shared
+/// libraries loaded at run time; ggml asks each CPU library whether this CPU can run it and keeps
+/// the best. Only the chosen directory is searched, never the working directory.
+#[cfg(feature = "cpu-dispatch")]
+mod dispatch {
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    use llama_cpp_2::{LlamaBackendDeviceType, list_llama_ggml_backend_devices, llama_backend};
+
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    /// Load the ggml backend libraries from `dir` instead of the default (see [`backends_dir`]).
+    /// Call it before the first model loads (the backends load once per process); returns `false`
+    /// when a directory was already set.
+    pub fn set_backends_dir(dir: PathBuf) -> bool {
+        DIR.set(dir).is_ok()
+    }
+
+    /// Where the ggml backend libraries (`libggml-cpu-*.so`, `ggml-cpu-*.dll`, …) are loaded from:
+    /// the directory given to [`set_backends_dir`], else `WEIRDNET_GGML_BACKENDS_DIR`, else the
+    /// executable's directory. A development build whose executable's directory has none falls
+    /// back to the directory llama-cpp-sys-2 built them in, so `cargo test` and `cargo run` work.
+    pub fn backends_dir() -> PathBuf {
+        if let Some(d) = DIR.get() {
+            return d.clone();
+        }
+        if let Some(d) = std::env::var_os("WEIRDNET_GGML_BACKENDS_DIR").filter(|d| !d.is_empty()) {
+            return d.into();
+        }
+        std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).unwrap_or_default()
+    }
+
+    fn has_cpu_library(dir: &Path) -> bool {
+        std::fs::read_dir(dir).map(|it| it.flatten().any(|e| is_cpu_library(&e.file_name().to_string_lossy()))).unwrap_or(false)
+    }
+
+    fn is_cpu_library(name: &str) -> bool {
+        let name = name.strip_prefix("lib").unwrap_or(name);
+        name.starts_with("ggml-cpu") && (name.ends_with(".so") || name.ends_with(".dll"))
+    }
+
+    fn has_cpu_device() -> bool {
+        list_llama_ggml_backend_devices().iter().any(|d| d.device_type == LlamaBackendDeviceType::Cpu)
+    }
+
+    /// Loads the backends once; `Err(dir)` when no CPU backend could be loaded from `dir`.
+    pub(super) fn load() -> Result<(), PathBuf> {
+        let dir = backends_dir();
+        if has_cpu_library(&dir) {
+            llama_backend::load_backends_from_path(&dir);
+        } else if DIR.get().is_none() && std::env::var_os("WEIRDNET_GGML_BACKENDS_DIR").is_none() {
+            // Not shipped next to the executable: a development build run from the target dir.
+            llama_backend::load_backends();
+        }
+        if has_cpu_device() { Ok(()) } else { Err(dir) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn cpu_libraries_are_recognised_on_every_platform() {
+            for n in ["libggml-cpu-haswell.so", "libggml-cpu-x64.so", "ggml-cpu-sse42.dll", "libggml-cpu-apple_m1.so", "libggml-cpu.so"] {
+                assert!(is_cpu_library(n), "{n}");
+            }
+            for n in ["libggml-base.so", "libggml-vulkan.so", "libllama.so", "libggml-cpu-x64.so.txt", "ggml.dll"] {
+                assert!(!is_cpu_library(n), "{n}");
+            }
+        }
+
+        #[test]
+        fn a_cpu_backend_loads_in_a_development_build() {
+            super::super::backend().unwrap();
+            assert!(has_cpu_device());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

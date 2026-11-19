@@ -22,3 +22,16 @@ jobs:
       - run: cargo test --locked --features llama,agent
       - run: RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --features llama,agent
       - run: cargo package --locked
+  cpu-dispatch:
+    # ggml built for every CPU level as shared libraries (slow: one CPU library per level).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --locked --all-targets --features cpu-dispatch,agent -- -D warnings
+      # llama-cpp-sys-2 0.1.161 hard-links its .so symlinks into the target dir and fails with
+      # "File exists" when a second build finds them dangling; remove them between builds.
+      - run: find target/debug -maxdepth 2 -xtype l -name 'lib*.so*' -delete
+      - run: cargo test --locked --features cpu-dispatch,agent

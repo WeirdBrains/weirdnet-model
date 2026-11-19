@@ -17,6 +17,10 @@ include = ["build.rs", "src/**", "README.md", "CHANGELOG.md", "LICENSE"]
 default = []
 # llama.cpp inference (CPU). Needs cmake and a C++ compiler to build.
 llama = ["dep:llama-cpp-2"]
+# Build ggml for every CPU level (x86: baseline x86-64 up to AVX-512 and AMX; ARM: armv8.0 up to
+# armv9.2, Apple M1 to M4) and pick the best one at run time, so release binaries run on any CPU.
+# llama.cpp becomes shared libraries the app must ship next to its executable; see the README.
+cpu-dispatch = ["llama", "llama-cpp-2/dynamic-backends"]
 # GPU backends for llama.cpp.
 vulkan = ["llama", "llama-cpp-2/vulkan"]
 metal = ["llama", "llama-cpp-2/metal"]
