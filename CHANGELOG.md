@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-19
+
 ### Fixed
 
 - `hw::plan()`: the note when no catalog chat model fits no longer names an application command (`ymirctl`); it says to add a smaller GGUF model.
