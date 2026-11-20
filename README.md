@@ -1,6 +1,6 @@
 # weirdnet-model
 
-Local models for WeirdBrains apps: download a GGUF from Hugging Face (only after consent, with
+Local models for [WeirdBrains](https://weirdbrains.com) apps: download a GGUF from Hugging Face (only after consent, with
 resume and a SHA-256 check), load it with llama.cpp, and stream tokens from a worker thread you can
 cancel. App-agnostic; the model is optional at build time.
 
