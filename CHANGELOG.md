@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Breaking: the `agent` feature needs `weirdnet-agent` 0.5. `LocalModel` reads text parts and refuses messages with images or audio (`ModelError::Unavailable`).
+
 ## [0.4.3] - 2026-11-20
 
 ### Changed

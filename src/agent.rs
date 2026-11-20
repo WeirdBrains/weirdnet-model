@@ -1,11 +1,12 @@
 //! `weirdnet_agent::ModelBackend` over a [`Worker`]: the agent's messages become chat turns (tools
 //! in the `<tool_call>` tag format), text streams to the session, and tool calls come back parsed.
+//! The worker reads text only: messages with image or audio parts are refused (`Unavailable`).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use weirdnet_agent::{CancelToken, DeltaSink, Message, ModelBackend, ModelError, ModelTurn, Role, ToolCall, ToolSpec};
+use weirdnet_agent::{CancelToken, DeltaSink, Message, Modalities, ModelBackend, ModelError, ModelTurn, Role, ToolCall, ToolSpec};
 
 use crate::prompt::{self, ChatMessage, ChatRole, Piece, ToolDesc, ToolStream};
 use crate::worker::{Chunk, GenerateRequest, StopCause, Worker};
@@ -32,7 +33,7 @@ pub fn turns(messages: &[Message], tools: &[ToolSpec]) -> Vec<ChatMessage> {
         tools.iter().map(|t| ToolDesc { name: t.name.clone(), description: t.description.clone(), schema: t.input_schema.clone() }).collect();
     let tool_text = prompt::tool_prompt(&descs);
     let mut out: Vec<ChatMessage> = Vec::new();
-    let mut system: Vec<String> = messages.iter().filter(|m| m.role == Role::System).map(|m| m.content.clone()).collect();
+    let mut system: Vec<String> = messages.iter().filter(|m| m.role == Role::System).map(|m| m.text().into_owned()).collect();
     if !tool_text.is_empty() {
         system.push(tool_text);
     }
@@ -42,9 +43,9 @@ pub fn turns(messages: &[Message], tools: &[ToolSpec]) -> Vec<ChatMessage> {
     for m in messages {
         match m.role {
             Role::System => {}
-            Role::User => out.push(ChatMessage::new(ChatRole::User, m.content.clone())),
+            Role::User => out.push(ChatMessage::new(ChatRole::User, m.text().into_owned())),
             Role::Assistant => {
-                let mut text = m.content.clone();
+                let mut text = m.text().into_owned();
                 for c in &m.tool_calls {
                     text.push_str(&prompt::call_text(&c.name, &c.arguments));
                 }
@@ -57,7 +58,7 @@ pub fn turns(messages: &[Message], tools: &[ToolSpec]) -> Vec<ChatMessage> {
                     .find(|c| Some(&c.id) == m.tool_call_id.as_ref())
                     .map(|c| c.name.as_str())
                     .unwrap_or("tool");
-                out.push(ChatMessage::new(ChatRole::User, prompt::result_text(name, &m.content, false)));
+                out.push(ChatMessage::new(ChatRole::User, prompt::result_text(name, &m.text(), false)));
             }
             // Roles added to `weirdnet_agent::Role` later are not sent to the model.
             _ => {}
@@ -73,6 +74,9 @@ impl ModelBackend for LocalModel {
     }
 
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec], deltas: &DeltaSink, cancel: &CancelToken) -> Result<ModelTurn, ModelError> {
+        if let Some(what) = Modalities::TEXT.lacking(weirdnet_agent::model::needs(messages)) {
+            return Err(ModelError::Unavailable(format!("{} takes text only here; the local llama.cpp worker reads no {what}", self.name)));
+        }
         let mut req = GenerateRequest::new(turns(messages, tools));
         req.max_tokens = self.max_tokens;
         req.temperature = self.temperature;
@@ -183,6 +187,17 @@ mod tests {
         let long = "w ".repeat(1000);
         let err = model.complete(&[Message::user(long)], &[], &DeltaSink::discard(), &cancel).await.unwrap_err();
         assert_eq!(err, ModelError::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn images_and_audio_are_refused_text_parts_are_read() {
+        use weirdnet_agent::ContentPart;
+        let model = LocalModel::new("echo", worker(0));
+        let img = Message::user(vec![ContentPart::text("what is it?"), ContentPart::image("data:image/png;base64,iVBORw0KGgo=")]);
+        let err = model.complete(&[img], &[], &DeltaSink::discard(), &CancelToken::new()).await.unwrap_err();
+        assert!(matches!(err, ModelError::Unavailable(ref m) if m.contains("reads no images")), "{err}");
+        let parts = Message::user(vec![ContentPart::text("open "), ContentPart::text("it")]);
+        assert_eq!(turns(&[parts], &[])[0].content, "open it");
     }
 
     #[tokio::test]
