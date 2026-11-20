@@ -18,7 +18,8 @@ cancel. App-agnostic; the model is optional at build time.
 - `cpu-dispatch` feature: llama.cpp built for every CPU level and picked at run time (see below).
 - `cpu`: whether this CPU can run the compiled-in llama.cpp. Loading a model checks it first.
 - `agent` feature: `agent::LocalModel` implements `weirdnet_agent::ModelBackend`, so the agent
-  loop can run on a local model with streamed text and parsed tool calls (`weirdnet-agent` 0.4).
+  loop can run on a local model with streamed text and parsed tool calls (`weirdnet-agent` 0.5;
+  text only: messages with image or audio parts are refused).
 - `hw`: hardware detection and model sizing (see below).
 
 ```toml
