@@ -2,6 +2,16 @@
 
 Running log for [weirdnet-model](https://github.com/WeirdBrains/weirdnet-model), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-21: release 0.5.1
+
+What changed: release `v0.5.1` (tag [v0.5.1](https://github.com/WeirdBrains/weirdnet-model/releases/tag/v0.5.1), the `release: v0.5.1` commit right after this entry), approved by m3talsmith. It ships the Hub search, fit chooser, token, split-download, list and remove work below (5b0c043) to [crates.io](https://crates.io/crates/weirdnet-model/0.5.1); docs at [docs.rs](https://docs.rs/weirdnet-model/0.5.1).
+
+Checks run: the release script's checks from [release.toml](release.toml) (fmt, clippy `-D warnings` and tests with `llama,agent`, `cargo doc -D warnings`), then `cargo publish`.
+
+Not tested: as in the entry below.
+
+What's left and next: [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends) 0.3.0 moves to `weirdnet-model = "0.5.1"`.
+
 ## 2026-11-21: Hub search, fit chooser, token, split downloads, list and remove
 
 What changed (commit 5b0c043, on main, unreleased; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`):
