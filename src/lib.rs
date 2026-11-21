@@ -1,9 +1,14 @@
 //! Weirdnet local models.
 //!
 //! - [`catalog`]: pinned Gemma 4 E2B and E4B GGUF files (Hugging Face repo, file, size, SHA-256).
-//! - [`store`] and [`mod@download`]: where model files live, and a consent-gated download that
-//!   resumes a `.part` file and checks size and SHA-256 before the file appears.
-//! - [`hf`]: read a Hugging Face repo's GGUF files, so any repo can become a [`ModelSpec`].
+//! - [`store`] and [`mod@download`]: where model files live (list and remove them too), and a
+//!   consent-gated download that resumes a `.part` file and checks size and SHA-256 before the
+//!   file appears, for single and split models.
+//! - [`hf`]: search the Hugging Face Hub, read a repo's GGUF files (split files grouped) and a
+//!   file's header, so any repo can become a [`ModelSpec`]; [`HfToken`] for gated repos, read on
+//!   the downloading node only.
+//! - [`gguf`]: the GGUF header fields that size the KV cache.
+//! - [`fit`]: pick the largest file whose weights and KV cache fit the memory budget.
 //! - [`prompt`]: render chat turns with the model's own Jinja template, and the `<tool_call>`
 //!   tag format for tools (prompt text and a streaming parser).
 //! - [`worker`]: an [`Engine`] on its own thread, streaming text with cancel.
@@ -19,12 +24,15 @@
 pub mod catalog;
 pub mod cpu;
 pub mod download;
+pub mod fit;
+pub mod gguf;
 pub mod hf;
 pub mod hw;
 pub mod prompt;
 pub mod store;
 #[cfg(test)]
 mod testing;
+pub mod token;
 pub mod worker;
 
 #[cfg(feature = "agent")]
@@ -33,9 +41,11 @@ pub mod agent;
 pub mod llama;
 
 pub use catalog::{Device, ModelSpec, human};
-pub use download::{Consent, Progress, download};
+pub use download::{Consent, Progress, download, download_parts};
+pub use hf::Hub;
 pub use prompt::{ChatMessage, ChatRole};
-pub use store::ModelStore;
+pub use store::{ModelStore, StoredModel};
+pub use token::HfToken;
 pub use worker::{Chunk, Engine, GenerateRequest, Generation, Stats, Worker};
 
 /// Everything that can go wrong here.

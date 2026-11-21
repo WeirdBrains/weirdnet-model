@@ -6,9 +6,14 @@ cancel. App-agnostic; the model is optional at build time.
 
 - `catalog`: Gemma 4 E2B (phones, small laptops) and E4B (desktop) GGUF defaults, with repo, file,
   size and checksum. `catalog::default_for(Device)` picks one.
-- `ModelStore`, `download`: a cache directory (`WEIRDNET_MODELS_DIR` overrides it), a `Consent` the
-  user must give for exactly that model, `Progress` callbacks, `.part` resume and verification.
-- `hf`: list a repo's GGUF files and sizes for a model picker.
+- `ModelStore`, `download`, `download_parts`: a cache directory (`WEIRDNET_MODELS_DIR` overrides
+  it), a `Consent` the user must give for exactly that model, `Progress` callbacks, `.part` resume
+  and verification, split models part by part; `ModelStore::list` and `remove_local` for what is
+  on disk.
+- `hf`: search the Hub for GGUF repos, list a repo's models (split GGUFs grouped into one model,
+  quantization read from the file name) and read a file's header for KV sizing. `HfToken` for
+  gated and private repos, read on the downloading node only.
+- `fit`: pick the largest file whose weights plus KV cache fit the node's memory budget.
 - `prompt`: chat turns rendered through the model's own chat template, and a streaming parser that
   turns `<tool_call>` tags into tool calls.
 - `Worker`: one thread owns the engine; `Worker::generate` returns a `Generation` that streams
@@ -45,6 +50,35 @@ through the consent gate.
 let hw = weirdnet_model::hw::detect();
 let plan = weirdnet_model::hw::plan(&hw, weirdnet_model::hw::budget(&hw, None, None));
 ```
+
+## Hub search, fit and downloads
+
+```rust
+use weirdnet_model::{ModelStore, Consent, download_parts, fit, hf::Search, hw};
+
+let store = ModelStore::from_env();
+let hub = store.hub_client();
+let hits = hub.search(&Search::new("qwen3 8b").with_limit(10))?;
+let repo = &hits[0].id;
+let models = hub.models(repo)?; // split GGUFs come back as one model with all its parts
+let info = hub.gguf_info(repo, &models[0].first().name)?; // header only, through a Range request
+let hw = hw::detect();
+let opts = fit::FitOptions::default().with_slots(2).with_info(&info);
+let best = fit::choose(&models, &hw::budget(&hw, None, None), &opts).expect("something fits");
+let parts = best.model.specs(repo)?;
+// Show the user what will be fetched, then:
+let path = download_parts(&store, &parts, &Consent::given(&parts[0]), &mut |_| true)?;
+```
+
+Search and files come from the [Hugging Face Hub](https://huggingface.co). The footprint is the weights plus the KV cache for every slot at the chosen context, plus 10%
+for compute buffers, the same as the tiered catalog's. Without a header the KV cache is guessed
+high from the file size.
+
+The Hugging Face token comes from this node only: `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, or the
+token file at `HF_TOKEN_PATH`, `HF_HOME/token` or `~/.cache/huggingface/token`. `ModelStore::from_env`
+sends it only to the public Hub, never to a `WEIRDNET_HF_URL` mirror (`with_token` sends it to
+any Hub you pick). Redirects to other hosts don't carry it, its `Debug` output is redacted, and it
+has no serde support, so it can't travel to another node in a message.
 
 ## CPU support
 

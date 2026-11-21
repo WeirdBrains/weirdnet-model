@@ -1,5 +1,6 @@
-//! Consent-gated download of one model file: resumes a `.part`, checks the size and the SHA-256,
-//! and only then renames it into place.
+//! Consent-gated download of one model file, or every part of a split model: resumes a `.part`,
+//! checks the size and the SHA-256, and only then renames it into place. Requests carry the
+//! store's Hugging Face token when it may go to the store's Hub (see [`ModelStore::from_env`]).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -43,9 +44,10 @@ pub fn download(store: &ModelStore, spec: &ModelSpec, consent: &Consent, progres
     if consent.id != spec.id {
         return Err(Error::Consent);
     }
+    crate::hf::check_file(&spec.file)?;
     let dest = store.path(spec);
     let part = store.part_path(spec);
-    std::fs::create_dir_all(store.dir())?;
+    std::fs::create_dir_all(dest.parent().unwrap_or(store.dir()))?;
     let total = spec.size;
     if total > 0 && std::fs::metadata(&dest).is_ok_and(|m| m.len() == total) {
         match &spec.sha256 {
@@ -59,8 +61,7 @@ pub fn download(store: &ModelStore, spec: &ModelSpec, consent: &Consent, progres
     let have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
     let mut done = have;
     if have < total || total == 0 {
-        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
-        let mut req = agent.get(spec.url(store.hub()));
+        let mut req = store.hub_client().get(&spec.url(store.hub()));
         if have > 0 && have < total {
             req = req.header("Range", format!("bytes={have}-"));
         }
@@ -69,6 +70,9 @@ pub fn download(store: &ModelStore, spec: &ModelSpec, consent: &Consent, progres
         done = match status {
             206 => have,
             200 => 0,
+            s @ (401 | 403) if !store.has_token() => {
+                return Err(Error::Http(format!("the Hub answered {s}; {} may be gated or private (set HF_TOKEN on this node)", spec.repo)));
+            }
             s => return Err(Error::Http(format!("the Hub answered {s}"))),
         };
         let mut file = std::fs::OpenOptions::new().create(true).write(true).append(done > 0).truncate(done == 0).open(&part)?;
@@ -106,6 +110,24 @@ pub fn download(store: &ModelStore, spec: &ModelSpec, consent: &Consent, progres
     std::fs::rename(&part, &dest)?;
     progress(Progress { done, total });
     Ok(dest)
+}
+
+/// Downloads every part of a split model (or the one file of a single one), in order, with one
+/// [`Consent`] for the model: all `parts` must share its id (as
+/// [`RepoModel::specs`](crate::hf::RepoModel::specs) makes them). Progress counts all parts
+/// together. Returns the first part's path, which llama.cpp loads the whole model from.
+pub fn download_parts(store: &ModelStore, parts: &[ModelSpec], consent: &Consent, progress: &mut dyn FnMut(Progress) -> bool) -> Result<PathBuf> {
+    let first = parts.first().ok_or_else(|| Error::Model("no files to download".into()))?;
+    if parts.iter().any(|p| p.id != consent.id) {
+        return Err(Error::Consent);
+    }
+    let total: u64 = parts.iter().map(|p| p.size).sum();
+    let mut before = 0;
+    for p in parts {
+        download(store, p, consent, &mut |pr| progress(Progress { done: before + pr.done.min(p.size), total }))?;
+        before += p.size;
+    }
+    Ok(store.path(first))
 }
 
 /// Lower-case hex SHA-256 of a file.
@@ -199,6 +221,42 @@ mod tests {
         assert!(matches!(download(&store, &spec, &Consent::given(&other), &mut |_| true), Err(Error::Consent)));
         let err = download(&store, &spec, &Consent::given(&spec), &mut |_| true).unwrap_err();
         assert!(matches!(err, Error::Http(ref m) if m.contains("404")), "{err}");
+    }
+
+    #[test]
+    fn split_models_download_every_part_into_their_directory() {
+        let (a, b) = (body(), body()[..500_000].to_vec());
+        let hub = MockHub::start_with(vec![
+            ("/o/n/resolve/main/Q8_0/m-00001-of-00002.gguf".into(), "application/octet-stream", a.clone()),
+            ("/o/n/resolve/main/Q8_0/m-00002-of-00002.gguf".into(), "application/octet-stream", b.clone()),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(tmp.path()).with_hub(hub.url()).with_token(crate::HfToken::new("hf_t"));
+        let mut parts = Vec::new();
+        for (name, data) in [("Q8_0/m-00001-of-00002.gguf", &a), ("Q8_0/m-00002-of-00002.gguf", &b)] {
+            let mut s = spec_for(data);
+            (s.id, s.file) = ("m".into(), name.into());
+            parts.push(s);
+        }
+        let mut seen = Vec::new();
+        let path = download_parts(&store, &parts, &Consent::given(&parts[0]), &mut |p| {
+            seen.push(p);
+            true
+        })
+        .unwrap();
+        assert_eq!(path, tmp.path().join("Q8_0/m-00001-of-00002.gguf"));
+        assert_eq!(std::fs::read(tmp.path().join("Q8_0/m-00002-of-00002.gguf")).unwrap(), b);
+        let total = (a.len() + b.len()) as u64;
+        assert!(seen.iter().all(|p| p.total == total));
+        assert!(seen.windows(2).all(|w| w[0].done <= w[1].done), "progress only goes up");
+        assert_eq!(seen.last().unwrap().done, total);
+        assert!(hub.seen().iter().all(|s| s.auth.as_deref() == Some("Bearer hf_t")));
+        let mut other = parts[0].clone();
+        other.id = "x".into();
+        assert!(matches!(download_parts(&store, &parts, &Consent::given(&other), &mut |_| true), Err(Error::Consent)));
+        let mut evil = parts[0].clone();
+        evil.file = "../evil.gguf".into();
+        assert!(download(&store, &evil, &Consent::given(&evil), &mut |_| true).is_err());
     }
 
     #[test]

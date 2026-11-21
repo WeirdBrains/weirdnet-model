@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- `hf::Hub`: Hub search (`Search`, `SearchHit`), a repo's models with split GGUFs grouped (`RepoModel`, `group_files`, `quant_of`), and `gguf_info` to read a file's header through a `Range` request.
+- `HfToken`: a Hugging Face token read on the downloading node (`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, token files); `ModelStore::from_env` sends it to the public Hub only, `ModelStore::with_token` sets one for any Hub.
+- `gguf::read_info`: the header fields that size the KV cache.
+- `fit`: the largest file whose weights and KV cache fit a `Budget` (`choose`, `rank`, `FitOptions`).
+- `download_parts`: split models, all parts under one consent.
+- `ModelStore::list` and `ModelStore::remove_local`: models on disk, split parts grouped.
+
+### Fixed
+
+- `download` creates the file's own directory, so files in repo subdirectories download, and refuses file names that leave the store.
+
 ## [0.5.0] - 2026-11-20
 
 ### Changed
