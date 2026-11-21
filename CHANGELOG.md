@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-21
+
 ### Added
 
 - `hf::Hub`: Hub search (`Search`, `SearchHit`), a repo's models with split GGUFs grouped (`RepoModel`, `group_files`, `quant_of`), and `gguf_info` to read a file's header through a `Range` request.
