@@ -80,6 +80,36 @@ sends it only to the public Hub, never to a `WEIRDNET_HF_URL` mirror (`with_toke
 any Hub you pick). Redirects to other hosts don't carry it, its `Debug` output is redacted, and it
 has no serde support, so it can't travel to another node in a message.
 
+## LoRA adapters
+
+```rust
+use weirdnet_model::{ModelStore, Consent, download_adapter};
+
+let store = ModelStore::from_env();
+let hub = store.hub_client();
+let adapters = hub.adapters("owner/my-tune")?; // GGUF LoRA files and PEFT directories
+let tune = &adapters[0]; // id, format, files, size, architecture, base_model, rank, alpha
+// Show the user what will be fetched, then:
+let path = download_adapter(&store, "owner/my-tune", tune, &Consent::given_adapter(tune), &mut |_| true)?;
+for a in store.adapters() {
+    println!("{} ({:?}) for {:?}", a.id, a.format, a.base_model);
+}
+```
+
+A GGUF file is an adapter when its header says `general.type` = `adapter`; LoRA adapters also
+have `adapter.type` = `lora` and `adapter.lora.alpha`, the keys
+[llama.cpp](https://github.com/ggml-org/llama.cpp)'s `convert_lora_to_gguf.py` writes.
+`gguf::read_header` reads any GGUF header (models and adapters; `read_info` still fails on
+adapters, which have no blocks). A PEFT adapter is an `adapter_config.json` with `peft_type`
+LORA next to `adapter_model.safetensors` (or `.bin`), the layout vLLM serves.
+
+Adapters are never models: `Hub::models` reads the header of every file whose name hints at an
+adapter (a `lora` or `adapter` word) and leaves real adapters out, so fits never rank one, and
+`ModelStore::list` skips `adapters/` and hinted GGUFs whose header says adapter. Hub searches
+leave adapter repos out unless `Search::with_adapters(true)`. Adapters download into
+`adapters/<id>/` under the store with the same consent, resume and SHA-256 checks as models, plus
+an `adapter.json` with the repo, format and base model (no paths).
+
 ## CPU support
 
 llama.cpp's build turns on AVX, AVX2, BMI2, FMA and F16C by default, so a plain `llama` build runs

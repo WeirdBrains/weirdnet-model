@@ -93,3 +93,57 @@ impl MockHub {
         self.log.lock().unwrap().iter().rev().find_map(|s| s.range.clone())
     }
 }
+
+/// A Hub with adapters: repo `o/n` holds a model GGUF (`m-Q4_0.gguf`), a LoRA GGUF
+/// (`m-LoRA-F16.gguf`, llama.cpp's keys) and a PEFT adapter in `tune/`; repo `o/peft` is a PEFT
+/// adapter at its root, tagged as one. Files carry their SHA-256 like LFS files.
+pub fn adapter_hub() -> MockHub {
+    use sha2::{Digest, Sha256};
+    let sum = |b: &[u8]| Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let mut model = crate::gguf::header(&[
+        ("general.architecture", serde_json::json!("qwen3")),
+        ("qwen3.block_count", serde_json::json!(2)),
+        ("qwen3.attention.head_count", serde_json::json!(4)),
+        ("qwen3.attention.key_length", serde_json::json!(16)),
+    ]);
+    model.resize(4000, 0);
+    let mut lora = crate::gguf::lora_header("qwen3");
+    lora.resize(1500, 1);
+    let config = br#"{"peft_type":"LORA","r":16,"lora_alpha":32,"base_model_name_or_path":"Org/Base-8B","target_modules":["q_proj"]}"#.to_vec();
+    let root_config = br#"{"peft_type":"LORA","r":8,"lora_alpha":16,"base_model_name_or_path":"/home/someone/base"}"#.to_vec();
+    let weights = vec![9u8; 2500];
+    let repo = format!(
+        r#"{{"id":"o/n","tags":["gguf"],"siblings":[
+            {{"rfilename":"m-Q4_0.gguf","size":{},"lfs":{{"sha256":"{}"}}}},
+            {{"rfilename":"m-LoRA-F16.gguf","size":{},"lfs":{{"sha256":"{}"}}}},
+            {{"rfilename":"tune/adapter_config.json","size":{}}},
+            {{"rfilename":"tune/adapter_model.safetensors","size":{},"lfs":{{"sha256":"{}"}}}},
+            {{"rfilename":"README.md","size":3}}]}}"#,
+        model.len(),
+        sum(&model),
+        lora.len(),
+        sum(&lora),
+        config.len(),
+        weights.len(),
+        sum(&weights)
+    );
+    let peft = format!(
+        r#"{{"id":"o/peft","library_name":"peft","tags":["peft","base_model:adapter:Org/Base-8B"],"siblings":[
+            {{"rfilename":"adapter_config.json","size":{}}},
+            {{"rfilename":"adapter_model.safetensors","size":{},"lfs":{{"sha256":"{}"}}}}]}}"#,
+        root_config.len(),
+        weights.len(),
+        sum(&weights)
+    );
+    let bin = "application/octet-stream";
+    MockHub::start_with(vec![
+        ("/api/models/o/n".into(), "application/json", repo.into_bytes()),
+        ("/api/models/o/peft".into(), "application/json", peft.into_bytes()),
+        ("/o/n/resolve/main/m-Q4_0.gguf".into(), bin, model),
+        ("/o/n/resolve/main/m-LoRA-F16.gguf".into(), bin, lora),
+        ("/o/n/resolve/main/tune/adapter_config.json".into(), "application/json", config),
+        ("/o/n/resolve/main/tune/adapter_model.safetensors".into(), bin, weights.clone()),
+        ("/o/peft/resolve/main/adapter_config.json".into(), "application/json", root_config),
+        ("/o/peft/resolve/main/adapter_model.safetensors".into(), bin, weights),
+    ])
+}

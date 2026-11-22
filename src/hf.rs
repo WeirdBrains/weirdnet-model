@@ -1,5 +1,7 @@
 //! Hugging Face Hub: search for GGUF repos, read a repo's GGUF files (split files grouped into
-//! one model), read a file's header for KV sizing, so any repo can become a [`ModelSpec`].
+//! one model), read a file's header for KV sizing, so any repo can become a [`ModelSpec`]; and
+//! find a repo's LoRA adapters ([`Hub::adapters`]: GGUF LoRA files and PEFT safetensors), which
+//! are never listed as models.
 //!
 //! [`Hub`] sends this node's [`HfToken`] (if any) with every request; redirects to other hosts
 //! (the file CDN) don't carry it.
@@ -8,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::catalog::ModelSpec;
-use crate::gguf::{self, GgufInfo};
+use crate::gguf::{self, GgufHeader, GgufInfo};
 use crate::token::HfToken;
 use crate::{Error, Result};
 /// A repo id: `owner/name`, Hub characters only (never a path trick).
@@ -35,22 +37,98 @@ pub fn repo_files(hub: &str, repo: &str) -> Result<Vec<RepoFile>> {
     Hub::new(hub).repo_files(repo)
 }
 
-/// The Hub's file list in a repo's model info (`siblings`), GGUF model files only.
-pub fn parse_files(v: &Value) -> Vec<RepoFile> {
+/// Every file in a repo's model info (`siblings`).
+fn siblings(v: &Value) -> Vec<RepoFile> {
     v["siblings"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|s| {
             let name = s["rfilename"].as_str()?;
-            let file = name.rsplit('/').next().unwrap_or(name);
-            let lower = file.to_ascii_lowercase();
-            if !lower.ends_with(".gguf") || lower.starts_with("mmproj") || lower.starts_with("mtp-") {
-                return None;
-            }
             Some(RepoFile { name: name.to_string(), size: s["size"].as_u64().unwrap_or(0), sha256: s["lfs"]["sha256"].as_str().map(str::to_string) })
         })
         .collect()
+}
+
+/// The Hub's file list in a repo's model info (`siblings`), GGUF model files only.
+pub fn parse_files(v: &Value) -> Vec<RepoFile> {
+    siblings(v)
+        .into_iter()
+        .filter(|f| {
+            let file = f.name.rsplit('/').next().unwrap_or(&f.name);
+            let lower = file.to_ascii_lowercase();
+            lower.ends_with(".gguf") && !lower.starts_with("mmproj") && !lower.starts_with("mtp-")
+        })
+        .collect()
+}
+
+/// Whether a file name hints at an adapter: a `lora`, `qlora`, `adapter` or `adapters` word in
+/// it (`Qwen3-8B-tune-LoRA-F16.gguf`). Only a hint: [`gguf::read_header`] decides.
+pub fn adapter_hint(name: &str) -> bool {
+    let file = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    file.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| matches!(w, "lora" | "qlora" | "adapter" | "adapters"))
+}
+
+/// Hub tags that mark a repo as an adapter: `base_model:adapter:...`, or the `peft` library.
+fn adapter_tags(v: &Value) -> bool {
+    v["library_name"].as_str() == Some("peft")
+        || v["tags"].as_array().into_iter().flatten().filter_map(Value::as_str).any(|t| t == "peft" || t.starts_with("base_model:adapter:"))
+}
+
+/// The base model a repo's tags or model card name (`base_model:adapter:owner/name`, then the
+/// card's `base_model`).
+fn tagged_base(v: &Value) -> Option<String> {
+    let tagged = v["tags"].as_array().into_iter().flatten().filter_map(Value::as_str).find_map(|t| t.strip_prefix("base_model:adapter:"));
+    let card = match &v["cardData"]["base_model"] {
+        Value::String(s) => Some(s.as_str()),
+        Value::Array(a) => a.first().and_then(Value::as_str),
+        _ => None,
+    };
+    tagged.or(card).filter(|b| check_repo(b).is_ok()).map(str::to_string)
+}
+
+/// How an adapter is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AdapterFormat {
+    /// One GGUF file (`general.type` = `adapter`, `adapter.type` = `lora`), for llama.cpp.
+    GgufLora,
+    /// A PEFT directory (`adapter_config.json` and `adapter_model.safetensors`), for vLLM.
+    Peft,
+}
+
+/// One LoRA adapter in a repo ([`Hub::adapters`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RepoAdapter {
+    /// The GGUF file stem, or the PEFT directory's name (the repo's name for one at the root).
+    pub id: String,
+    pub format: AdapterFormat,
+    /// The files to fetch: the GGUF, or `adapter_config.json` then the weights.
+    pub files: Vec<RepoFile>,
+    pub size: u64,
+    /// `general.architecture` of a GGUF adapter; PEFT configs don't say.
+    pub architecture: Option<String>,
+    /// The base model as a Hub id: from the GGUF header, PEFT's `base_model_name_or_path`, or the
+    /// repo's tags.
+    pub base_model: Option<String>,
+    /// PEFT `r`; GGUF adapters don't record it.
+    pub rank: Option<u32>,
+    /// `adapter.lora.alpha` or PEFT `lora_alpha`.
+    pub alpha: Option<f32>,
+}
+
+/// `(rank, alpha, base model)` from a PEFT `adapter_config.json`, if it is a LoRA one.
+pub(crate) fn peft_lora(config: &Value) -> Option<(Option<u32>, Option<f32>, Option<String>)> {
+    let kind = config["peft_type"].as_str().unwrap_or("LORA");
+    if !kind.eq_ignore_ascii_case("lora") {
+        return None;
+    }
+    let rank = config["r"].as_u64().and_then(|r| u32::try_from(r).ok());
+    let alpha = config["lora_alpha"].as_f64().map(|a| a as f32);
+    let base = config["base_model_name_or_path"].as_str().filter(|b| check_repo(b).is_ok()).map(str::to_string);
+    Some((rank, alpha, base))
 }
 
 impl ModelSpec {
@@ -88,11 +166,14 @@ pub struct Search {
     pub limit: usize,
     /// Only repos tagged `gguf` (default on).
     pub gguf_only: bool,
+    /// Keep adapter repos (PEFT or `base_model:adapter:` tags; default off, so hits are models).
+    #[serde(default)]
+    pub adapters: bool,
 }
 
 impl Search {
     pub fn new(query: impl Into<String>) -> Self {
-        Self { query: query.into(), limit: 20, gguf_only: true }
+        Self { query: query.into(), limit: 20, gguf_only: true, adapters: false }
     }
 
     pub fn with_limit(mut self, limit: usize) -> Self {
@@ -102,6 +183,12 @@ impl Search {
 
     pub fn with_gguf_only(mut self, on: bool) -> Self {
         self.gguf_only = on;
+        self
+    }
+
+    /// Keep adapter repos in the hits ([`SearchHit::adapter`] marks them).
+    pub fn with_adapters(mut self, on: bool) -> Self {
+        self.adapters = on;
         self
     }
 }
@@ -118,6 +205,9 @@ pub struct SearchHit {
     pub gated: bool,
     pub pipeline_tag: Option<String>,
     pub last_modified: Option<String>,
+    /// The repo holds an adapter, not a model (its Hub tags say PEFT or `base_model:adapter:`).
+    #[serde(default)]
+    pub adapter: bool,
 }
 
 /// Parses the Hub's `/api/models` answer; entries without a valid repo id are dropped.
@@ -139,6 +229,7 @@ pub fn parse_search(v: &Value) -> Vec<SearchHit> {
                 },
                 pipeline_tag: m["pipeline_tag"].as_str().map(str::to_string),
                 last_modified: m["lastModified"].as_str().map(str::to_string),
+                adapter: adapter_tags(m),
             })
         })
         .collect()
@@ -324,34 +415,117 @@ impl Hub {
         if search.gguf_only {
             req = req.query("filter", "gguf");
         }
-        Ok(parse_search(&self.json(req, "the search")?))
+        let mut hits = parse_search(&self.json(req, "the search")?);
+        if !search.adapters {
+            hits.retain(|h| !h.adapter);
+        }
+        Ok(hits)
     }
 
-    /// The GGUF model files of `repo` (see [`repo_files`]).
-    pub fn repo_files(&self, repo: &str) -> Result<Vec<RepoFile>> {
+    fn repo_info(&self, repo: &str) -> Result<Value> {
         check_repo(repo)?;
-        let v = self.json(self.get(&format!("{}/api/models/{repo}?blobs=true", self.url)), repo)?;
-        Ok(parse_files(&v))
+        self.json(self.get(&format!("{}/api/models/{repo}?blobs=true", self.url)), repo)
     }
 
-    /// The downloadable models of `repo`, split files grouped ([`group_files`]).
+    /// The GGUF model files of `repo` (see [`repo_files`]). Adapters are still in this list;
+    /// [`Hub::models`] leaves them out.
+    pub fn repo_files(&self, repo: &str) -> Result<Vec<RepoFile>> {
+        Ok(parse_files(&self.repo_info(repo)?))
+    }
+
+    /// The downloadable models of `repo`, split files grouped ([`group_files`]). Adapters are
+    /// left out: a file whose name hints at one ([`adapter_hint`]) has its header read, and is
+    /// dropped when the header says `general.type` = `adapter`.
     pub fn models(&self, repo: &str) -> Result<Vec<RepoModel>> {
-        Ok(group_files(&self.repo_files(repo)?))
+        let files: Vec<RepoFile> = self
+            .repo_files(repo)?
+            .into_iter()
+            .filter(|f| !(adapter_hint(&f.name) && self.gguf_header(repo, &f.name).is_ok_and(|h| h.kind.is_adapter())))
+            .collect();
+        Ok(group_files(&files))
     }
 
-    /// The header of `file` in `repo` (its first [`gguf::HEADER_LIMIT`] bytes at most, through a
-    /// `Range` request), for KV sizing. For a split model pass its first part.
-    pub fn gguf_info(&self, repo: &str, file: &str) -> Result<GgufInfo> {
+    fn header_body(&self, repo: &str, file: &str) -> Result<ureq::http::Response<ureq::Body>> {
         check_repo(repo)?;
         check_file(file)?;
         let url = format!("{}/{repo}/resolve/main/{file}", self.url);
-        let mut resp =
-            self.get(&url).header("Range", format!("bytes=0-{}", gguf::HEADER_LIMIT - 1)).call().map_err(|e| Error::Http(e.to_string()))?;
+        let resp = self.get(&url).header("Range", format!("bytes=0-{}", gguf::HEADER_LIMIT - 1)).call().map_err(|e| Error::Http(e.to_string()))?;
         match resp.status().as_u16() {
-            200 | 206 => {}
-            s => return Err(Error::Http(format!("the Hub answered {s} for {file}"))),
+            200 | 206 => Ok(resp),
+            s => Err(Error::Http(format!("the Hub answered {s} for {file}"))),
         }
-        gguf::read_info(resp.body_mut().as_reader())
+    }
+
+    /// The header of `file` in `repo` (its first [`gguf::HEADER_LIMIT`] bytes at most, through a
+    /// `Range` request), for KV sizing. For a split model pass its first part. Fails on adapters;
+    /// see [`Hub::gguf_header`].
+    pub fn gguf_info(&self, repo: &str, file: &str) -> Result<GgufInfo> {
+        gguf::read_info(self.header_body(repo, file)?.body_mut().as_reader())
+    }
+
+    /// The header of `file` in `repo`, of any kind ([`gguf::read_header`]): whether it is a model
+    /// or an adapter, its architecture and base model.
+    pub fn gguf_header(&self, repo: &str, file: &str) -> Result<GgufHeader> {
+        gguf::read_header(self.header_body(repo, file)?.body_mut().as_reader())
+    }
+
+    /// The LoRA adapters in `repo`: GGUF files whose header says `general.type` = `adapter` and
+    /// `adapter.type` = `lora` (files with an [`adapter_hint`] in the name, or every GGUF when
+    /// the repo's tags mark it as an adapter), and PEFT directories (an `adapter_config.json`
+    /// with `peft_type` LORA next to `adapter_model.safetensors` or `adapter_model.bin`). Sorted
+    /// by id.
+    pub fn adapters(&self, repo: &str) -> Result<Vec<RepoAdapter>> {
+        let v = self.repo_info(repo)?;
+        let all = siblings(&v);
+        let tagged = adapter_tags(&v);
+        let base = tagged_base(&v);
+        let mut out = Vec::new();
+        for f in parse_files(&v).into_iter().filter(|f| tagged || adapter_hint(&f.name)) {
+            let Ok(h) = self.gguf_header(repo, &f.name) else { continue };
+            let gguf::GgufKind::Adapter { alpha, .. } = &h.kind else { continue };
+            if !h.kind.is_lora() {
+                continue;
+            }
+            let file = f.name.rsplit('/').next().unwrap_or(&f.name);
+            let id = file.strip_suffix(".gguf").or_else(|| file.strip_suffix(".GGUF")).unwrap_or(file).to_string();
+            out.push(RepoAdapter {
+                id,
+                format: AdapterFormat::GgufLora,
+                size: f.size,
+                architecture: Some(h.architecture.clone()),
+                base_model: h.base_model.clone().or_else(|| base.clone()),
+                rank: None,
+                alpha: *alpha,
+                files: vec![f],
+            });
+        }
+        for config in all.iter().filter(|f| f.name == "adapter_config.json" || f.name.ends_with("/adapter_config.json")) {
+            let dir = config.name.strip_suffix("adapter_config.json").unwrap_or("");
+            let Some(weights) =
+                ["adapter_model.safetensors", "adapter_model.bin"].iter().find_map(|w| all.iter().find(|f| f.name == format!("{dir}{w}")))
+            else {
+                continue;
+            };
+            check_file(&config.name)?;
+            let Ok(json) = self.json(self.get(&format!("{}/{repo}/resolve/main/{}", self.url, config.name)), &config.name) else { continue };
+            let Some((rank, alpha, peft_base)) = peft_lora(&json) else { continue };
+            let id = match dir.trim_end_matches('/').rsplit('/').next() {
+                Some(d) if !d.is_empty() => d.to_string(),
+                _ => repo.rsplit('/').next().unwrap_or(repo).to_string(),
+            };
+            out.push(RepoAdapter {
+                id,
+                format: AdapterFormat::Peft,
+                size: config.size + weights.size,
+                architecture: None,
+                base_model: peft_base.or_else(|| base.clone()),
+                rank,
+                alpha,
+                files: vec![config.clone(), weights.clone()],
+            });
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
     }
 }
 
@@ -497,6 +671,62 @@ mod tests {
         assert_eq!(repo_files(hub.url(), "o/n").unwrap().len(), 2);
         assert!(matches!(repo_files(hub.url(), "o/missing"), Err(Error::Http(ref m)) if m.contains("404")));
         assert!(matches!(repo_files(hub.url(), "bad"), Err(Error::BadRepo(_))));
+    }
+
+    #[test]
+    fn adapter_hints_are_whole_words() {
+        for yes in ["m-LoRA-F16.gguf", "d/qwen3_lora.gguf", "tune-adapter.gguf", "x.QLoRA.gguf"] {
+            assert!(adapter_hint(yes), "{yes}");
+        }
+        for no in ["Flora-7B-Q4_0.gguf", "explorer.gguf", "m-Q4_0.gguf", "lorax.gguf"] {
+            assert!(!adapter_hint(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn models_leave_adapters_out_and_adapters_finds_them() {
+        let hub = crate::testing::adapter_hub();
+        let client = Hub::new(hub.url());
+        assert_eq!(client.repo_files("o/n").unwrap().len(), 2, "the raw list still has both GGUFs");
+        let models = client.models("o/n").unwrap();
+        assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["m-Q4_0"]);
+        let header = client.gguf_header("o/n", "m-LoRA-F16.gguf").unwrap();
+        assert!(header.kind.is_lora());
+        assert!(client.gguf_info("o/n", "m-LoRA-F16.gguf").is_err(), "an adapter has no KV shape");
+        assert_eq!(client.gguf_header("o/n", "m-Q4_0.gguf").unwrap().info.map(|i| i.layers), Some(2));
+
+        let found = client.adapters("o/n").unwrap();
+        assert_eq!(found.len(), 2, "{found:?}");
+        let (gguf, peft) = (&found[0], &found[1]);
+        assert_eq!((gguf.id.as_str(), gguf.format, gguf.size), ("m-LoRA-F16", AdapterFormat::GgufLora, 1500));
+        assert_eq!(
+            (gguf.architecture.as_deref(), gguf.base_model.as_deref(), gguf.alpha, gguf.rank),
+            (Some("qwen3"), Some("Org/Base-8B"), Some(32.5), None)
+        );
+        assert_eq!((peft.id.as_str(), peft.format, peft.rank, peft.alpha), ("tune", AdapterFormat::Peft, Some(16), Some(32.0)));
+        assert_eq!(peft.files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["tune/adapter_config.json", "tune/adapter_model.safetensors"]);
+        assert_eq!(peft.base_model.as_deref(), Some("Org/Base-8B"));
+
+        let root = client.adapters("o/peft").unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!((root[0].id.as_str(), root[0].rank), ("peft", Some(8)));
+        assert_eq!(root[0].base_model.as_deref(), Some("Org/Base-8B"), "a local base path is ignored; the tag names the base");
+        assert!(client.models("o/peft").unwrap().is_empty());
+    }
+
+    #[test]
+    fn searches_leave_adapter_repos_out_unless_asked() {
+        let body = r#"[{"id":"o/m-GGUF","tags":["gguf"]},{"id":"o/tune","library_name":"peft","tags":["peft"]},
+            {"id":"o/lora-GGUF","tags":["gguf","base_model:adapter:Org/Base-8B"]}]"#;
+        let hub = MockHub::start_with(vec![("/api/models".into(), "application/json", body.as_bytes().to_vec())]);
+        let client = Hub::new(hub.url());
+        let hits = client.search(&Search::new("x")).unwrap();
+        assert_eq!(hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), ["o/m-GGUF"]);
+        let all = client.search(&Search::new("x").with_adapters(true)).unwrap();
+        assert_eq!(
+            all.iter().map(|h| (h.id.as_str(), h.adapter)).collect::<Vec<_>>(),
+            [("o/m-GGUF", false), ("o/tune", true), ("o/lora-GGUF", true)]
+        );
     }
 
     /// The real Hub: `cargo test -- --ignored live_hub` (reads a few MB of one header).

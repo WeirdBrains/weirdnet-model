@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- LoRA adapters: `gguf::read_header` (`GgufHeader`, `GgufKind`) reads adapter GGUFs too; `Hub::adapters` (`RepoAdapter`, `AdapterFormat`) finds GGUF LoRA and PEFT adapters in a repo; `Hub::gguf_header`; `download_adapter` with `Consent::given_adapter`; `ModelStore::adapters`, `remove_adapter` and `adapter_dir` (`StoredAdapter`).
+- `Search::with_adapters` and `SearchHit::adapter`; `hf::adapter_hint`.
+
+### Changed
+
+- Adapters are no longer models: `Hub::models` (and so fits), `ModelStore::list` and Hub searches leave them out.
+
 ## [0.5.1] - 2026-11-21
 
 ### Added

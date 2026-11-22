@@ -1,5 +1,6 @@
 //! The parts of a GGUF header that size a model's KV cache, read from the start of the file
-//! (over HTTP with a `Range` request, see [`Hub::gguf_info`](crate::hf::Hub::gguf_info)).
+//! (over HTTP with a `Range` request, see [`Hub::gguf_info`](crate::hf::Hub::gguf_info)), and
+//! whether a file is a model or a LoRA adapter ([`read_header`]).
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -36,9 +37,57 @@ impl GgufInfo {
     }
 }
 
+/// What kind of GGUF file this is (`general.type`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum GgufKind {
+    /// A model (`general.type` is `model` or missing).
+    Model,
+    /// An adapter (`general.type` is `adapter`), applied on top of a base model of the same
+    /// architecture.
+    Adapter {
+        /// `adapter.type`, such as `lora`.
+        adapter_type: String,
+        /// `adapter.lora.alpha`, when set.
+        alpha: Option<f32>,
+    },
+}
+
+impl GgufKind {
+    /// A LoRA adapter (`adapter.type` is `lora`), the kind llama.cpp's `--lora` takes.
+    pub fn is_lora(&self) -> bool {
+        matches!(self, GgufKind::Adapter { adapter_type, .. } if adapter_type == "lora")
+    }
+
+    pub fn is_adapter(&self) -> bool {
+        matches!(self, GgufKind::Adapter { .. })
+    }
+}
+
+/// What a GGUF header says about a file of any kind (see [`read_header`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GgufHeader {
+    pub kind: GgufKind,
+    /// `general.architecture`, such as `llama` or `qwen3`. An adapter needs a base model with
+    /// the same one.
+    pub architecture: String,
+    /// The model this one was made from, as a Hub id (`owner/name`) when the header has a
+    /// Hugging Face `general.base_model.0.repo_url`. For an adapter this is its base model.
+    pub base_model: Option<String>,
+    /// The repo the weights came from, as a Hub id when the header has a Hugging Face
+    /// `general.source.repo_url` or `general.repo_url`.
+    pub repo: Option<String>,
+    /// The KV shape of a model; `None` for adapters (they have no blocks of their own) and
+    /// headers that lack the figures.
+    pub info: Option<GgufInfo>,
+}
+
 #[derive(Debug, Clone)]
 enum Val {
     Int(u64),
+    Float(f64),
     Str(String),
     Ints(Vec<u64>),
     Other,
@@ -137,14 +186,18 @@ impl<R: Read> Reader<R> {
                 }
                 Ok(if n <= 4096 && ints.len() as u64 == n { Val::Ints(ints) } else { Val::Other })
             }
+            6 => Ok(Val::Float(f32::from_le_bytes(self.bytes(4)?.try_into().expect("4 bytes")) as f64)),
+            12 => Ok(Val::Float(f64::from_le_bytes(self.bytes(8)?.try_into().expect("8 bytes")))),
             t => Ok(self.scalar(t)?.map(Val::Int).unwrap_or(Val::Other)),
         }
     }
 }
 
-/// Reads the metadata at the start of a GGUF file (versions 2 and 3) and stops before the
+type Kv = HashMap<String, Val>;
+
+/// The key-value metadata at the start of a GGUF file (versions 2 and 3), stopping before the
 /// tensor table.
-pub fn read_info(r: impl Read) -> Result<GgufInfo> {
+fn read_kv(r: impl Read) -> Result<Kv> {
     let mut r = Reader { inner: r, read: 0 };
     if r.bytes(4)? != b"GGUF" {
         return Err(Error::Model("not a GGUF file".into()));
@@ -155,17 +208,25 @@ pub fn read_info(r: impl Read) -> Result<GgufInfo> {
     }
     let _tensors = r.u64()?;
     let count = r.u64()?;
-    let mut kv: HashMap<String, Val> = HashMap::new();
+    let mut kv: Kv = HashMap::new();
     for _ in 0..count {
         let key = r.string()?;
         let t = r.u32()?;
         let v = r.value(t)?;
         kv.insert(key, v);
     }
-    let arch = match kv.get("general.architecture") {
-        Some(Val::Str(a)) => a.clone(),
-        _ => return Err(Error::Model("GGUF header has no general.architecture".into())),
-    };
+    Ok(kv)
+}
+
+fn architecture(kv: &Kv) -> Result<String> {
+    match kv.get("general.architecture") {
+        Some(Val::Str(a)) => Ok(a.clone()),
+        _ => Err(Error::Model("GGUF header has no general.architecture".into())),
+    }
+}
+
+fn info_from(kv: &Kv) -> Result<GgufInfo> {
+    let arch = architecture(kv)?;
     let int = |k: &str| match kv.get(&format!("{arch}.{k}")) {
         Some(Val::Int(v)) => Some(*v),
         _ => None,
@@ -192,6 +253,46 @@ pub fn read_info(r: impl Read) -> Result<GgufInfo> {
     Ok(GgufInfo { architecture: arch, layers, kv_heads_total, key_length, value_length, context_length, split_count })
 }
 
+/// Reads the metadata at the start of a GGUF file (versions 2 and 3) and stops before the
+/// tensor table. Fails on adapters, which have no blocks; see [`read_header`].
+pub fn read_info(r: impl Read) -> Result<GgufInfo> {
+    info_from(&read_kv(r)?)
+}
+
+/// `owner/name` from a Hugging Face repo URL (`https://huggingface.co/owner/name`).
+pub fn hub_id(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://huggingface.co/").or_else(|| url.strip_prefix("http://huggingface.co/"))?;
+    let id = rest.trim_end_matches('/');
+    crate::hf::check_repo(id).ok().map(|_| id.to_string())
+}
+
+/// Reads a GGUF header of any kind: a model (with its KV shape when the header has it) or an
+/// adapter (`general.type` = `adapter`, with `adapter.type` and `adapter.lora.alpha`). Unlike
+/// [`read_info`] it doesn't fail on adapters.
+pub fn read_header(r: impl Read) -> Result<GgufHeader> {
+    let kv = read_kv(r)?;
+    let architecture = architecture(&kv)?;
+    let text = |k: &str| match kv.get(k) {
+        Some(Val::Str(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    };
+    let kind = match text("general.type").as_deref() {
+        Some("adapter") => GgufKind::Adapter {
+            adapter_type: text("adapter.type").unwrap_or_default(),
+            alpha: match kv.get("adapter.lora.alpha") {
+                Some(Val::Float(a)) => Some(*a as f32),
+                Some(Val::Int(a)) => Some(*a as f32),
+                _ => None,
+            },
+        },
+        _ => GgufKind::Model,
+    };
+    let info = if kind.is_adapter() { None } else { info_from(&kv).ok() };
+    let base_model = text("general.base_model.0.repo_url").and_then(|u| hub_id(&u));
+    let repo = text("general.source.repo_url").or_else(|| text("general.repo_url")).and_then(|u| hub_id(&u));
+    Ok(GgufHeader { kind, architecture, base_model, repo, info })
+}
+
 /// GGUF header bytes for tests.
 #[cfg(test)]
 pub(crate) fn header(kv: &[(&str, serde_json::Value)]) -> Vec<u8> {
@@ -210,9 +311,13 @@ pub(crate) fn header(kv: &[(&str, serde_json::Value)]) -> Vec<u8> {
                 out.extend(8u32.to_le_bytes());
                 s(&mut out, text);
             }
-            serde_json::Value::Number(n) => {
+            serde_json::Value::Number(n) if n.is_u64() => {
                 out.extend(4u32.to_le_bytes());
                 out.extend((n.as_u64().unwrap() as u32).to_le_bytes());
+            }
+            serde_json::Value::Number(n) => {
+                out.extend(6u32.to_le_bytes());
+                out.extend((n.as_f64().unwrap() as f32).to_le_bytes());
             }
             serde_json::Value::Array(items) if items.first().is_some_and(|i| i.is_string()) => {
                 out.extend(9u32.to_le_bytes());
@@ -238,6 +343,22 @@ pub(crate) fn header(kv: &[(&str, serde_json::Value)]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// A LoRA adapter header with the keys `convert_lora_to_gguf.py` writes (llama.cpp b12590), for
+/// tests.
+#[cfg(test)]
+pub(crate) fn lora_header(arch: &str) -> Vec<u8> {
+    use serde_json::json;
+    header(&[
+        ("general.architecture", json!(arch)),
+        ("general.type", json!("adapter")),
+        ("general.name", json!("Tune")),
+        ("general.base_model.count", json!(1)),
+        ("general.base_model.0.repo_url", json!("https://huggingface.co/Org/Base-8B")),
+        ("adapter.type", json!("lora")),
+        ("adapter.lora.alpha", json!(32.5)),
+    ])
 }
 
 #[cfg(test)]
@@ -280,6 +401,40 @@ mod tests {
         let info = read_info(&h[..]).unwrap();
         assert_eq!((info.kv_heads_total, info.key_length, info.value_length, info.split_count), (4, 64, 64, 3));
         assert_eq!(info.kv_bytes_per_token(), 4 * 128 * 2);
+    }
+
+    #[test]
+    fn adapters_read_as_headers_but_not_as_info() {
+        let h = lora_header("qwen3");
+        assert!(read_info(&h[..]).is_err(), "an adapter has no block_count");
+        let head = read_header(&h[..]).unwrap();
+        assert_eq!(head.kind, GgufKind::Adapter { adapter_type: "lora".into(), alpha: Some(32.5) });
+        assert!(head.kind.is_lora() && head.kind.is_adapter());
+        assert_eq!((head.architecture.as_str(), head.base_model.as_deref(), head.info), ("qwen3", Some("Org/Base-8B"), None));
+    }
+
+    #[test]
+    fn models_read_as_headers_with_their_shape() {
+        let h = header(&[
+            ("general.architecture", json!("llama")),
+            ("general.type", json!("model")),
+            ("general.source.repo_url", json!("https://huggingface.co/Org/Base-8B")),
+            ("llama.block_count", json!(2)),
+            ("llama.attention.head_count", json!(4)),
+            ("llama.attention.key_length", json!(16)),
+        ]);
+        let head = read_header(&h[..]).unwrap();
+        assert_eq!(head.kind, GgufKind::Model);
+        assert!(!head.kind.is_lora());
+        assert_eq!(head.repo.as_deref(), Some("Org/Base-8B"));
+        assert_eq!(head.info.map(|i| i.layers), Some(2));
+        let bare = header(&[("general.architecture", json!("x"))]);
+        let head = read_header(&bare[..]).unwrap();
+        assert_eq!((head.kind, head.info), (GgufKind::Model, None), "a model header without the shape still reads");
+        assert!(read_header(&header(&[("general.type", json!("adapter"))])[..]).is_err(), "no architecture");
+        assert_eq!(hub_id("https://huggingface.co/a/b/"), Some("a/b".into()));
+        assert_eq!(hub_id("https://example.com/a/b"), None);
+        assert_eq!(hub_id("https://huggingface.co/a/b/tree/main"), None);
     }
 
     #[test]

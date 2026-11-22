@@ -1,13 +1,15 @@
 //! Weirdnet local models.
 //!
 //! - [`catalog`]: pinned Gemma 4 E2B and E4B GGUF files (Hugging Face repo, file, size, SHA-256).
-//! - [`store`] and [`mod@download`]: where model files live (list and remove them too), and a
-//!   consent-gated download that resumes a `.part` file and checks size and SHA-256 before the
-//!   file appears, for single and split models.
+//! - [`store`] and [`mod@download`]: where model files and LoRA adapters live (list and remove
+//!   them too), and a consent-gated download that resumes a `.part` file and checks size and
+//!   SHA-256 before the file appears, for single and split models and for adapters.
 //! - [`hf`]: search the Hugging Face Hub, read a repo's GGUF files (split files grouped) and a
-//!   file's header, so any repo can become a [`ModelSpec`]; [`HfToken`] for gated repos, read on
-//!   the downloading node only.
-//! - [`gguf`]: the GGUF header fields that size the KV cache.
+//!   file's header, so any repo can become a [`ModelSpec`]; find a repo's LoRA adapters (GGUF
+//!   and PEFT), which are never listed as models; [`HfToken`] for gated repos, read on the
+//!   downloading node only.
+//! - [`gguf`]: the GGUF header fields that size the KV cache, and whether a file is a model or
+//!   a LoRA adapter.
 //! - [`fit`]: pick the largest file whose weights and KV cache fit the memory budget.
 //! - [`prompt`]: render chat turns with the model's own Jinja template, and the `<tool_call>`
 //!   tag format for tools (prompt text and a streaming parser).
@@ -41,10 +43,10 @@ pub mod agent;
 pub mod llama;
 
 pub use catalog::{Device, ModelSpec, human};
-pub use download::{Consent, Progress, download, download_parts};
-pub use hf::Hub;
+pub use download::{Consent, Progress, download, download_adapter, download_parts};
+pub use hf::{AdapterFormat, Hub, RepoAdapter};
 pub use prompt::{ChatMessage, ChatRole};
-pub use store::{ModelStore, StoredModel};
+pub use store::{ModelStore, StoredAdapter, StoredModel};
 pub use token::HfToken;
 pub use worker::{Chunk, Engine, GenerateRequest, Generation, Stats, Worker};
 
