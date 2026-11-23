@@ -2,6 +2,17 @@
 
 Running log for [weirdnet-model](https://github.com/WeirdBrains/weirdnet-model), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-22: LoRA adapters merged to main
+
+What changed: fast-forwards main to [lora-adapters](https://github.com/WeirdBrains/weirdnet-model/tree/lora-adapters) (`78711f0`); main is ready for 0.5.2, not released. No code changes in the merge.
+
+Checks run: the `release.toml` checks on this checkout after the fast-forward (fmt, clippy `-D warnings` with `llama,agent`, tests with `llama,agent` — 70 passed, 2 ignored; `cargo doc -D warnings`); `cargo semver-checks` against 0.5.1 earlier today (no semver update required beyond a patch).
+
+Not tested: as in the entry below.
+
+What's left and next: release 0.5.2 (approved), then weirdnet-backends 0.4.0 (its lora-adapters branch) moves to `weirdnet-model = "0.5.2"`.
+
+
 ## 2026-11-22: LoRA adapters (branch `lora-adapters`)
 
 What changed (branch [lora-adapters](https://github.com/WeirdBrains/weirdnet-model/tree/lora-adapters), unreleased; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`), for LoRA serving in [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends):
