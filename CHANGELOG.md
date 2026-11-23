@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-22
+
 ### Added
 
 - LoRA adapters: `gguf::read_header` (`GgufHeader`, `GgufKind`) reads adapter GGUFs too; `Hub::adapters` (`RepoAdapter`, `AdapterFormat`) finds GGUF LoRA and PEFT adapters in a repo; `Hub::gguf_header`; `download_adapter` with `Consent::given_adapter`; `ModelStore::adapters`, `remove_adapter` and `adapter_dir` (`StoredAdapter`).
