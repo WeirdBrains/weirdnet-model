@@ -2,6 +2,18 @@
 
 Running log for [weirdnet-model](https://github.com/WeirdBrains/weirdnet-model), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-24: release 0.5.3
+
+What changed: release `v0.5.3` (tag [v0.5.3](https://github.com/WeirdBrains/weirdnet-model/releases/tag/v0.5.3), the `release: v0.5.3` commit right after this entry). It ships the model upload work below (`a3c3ad1`) to [crates.io](https://crates.io/crates/weirdnet-model/0.5.3); docs at [docs.rs](https://docs.rs/weirdnet-model/0.5.3).
+
+Release approval: m3talsmith approved publishing 0.5.3 to crates.io once main is green (2026-11-24, 9:21 PM ET).
+
+Checks run: CI green on `a3c3ad1`; the release script's checks from [release.toml](release.toml) (fmt, clippy `-D warnings` and tests with `llama,agent`, `cargo doc -D warnings`), then `cargo publish`.
+
+Not tested: as in the entry below.
+
+What's left and next: [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends) 0.4.4 moves to `weirdnet-model = "0.5.3"` and adds uploads to `models/1`.
+
 ## 2026-11-24: model uploads (artifact inspection, import, provenance)
 
 What changed (on main, for release 0.5.3; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`), the model side of the [model upload plan](https://github.com/WeirdBrains/ymir/blob/feature/model-upload-plan/docs/design/model-upload.md), for uploads in [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends):
