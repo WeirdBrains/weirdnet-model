@@ -1,11 +1,18 @@
 //! Where model files live on disk, and which Hub they come from. LoRA adapters live apart, in
 //! `adapters/<id>/` ([`ModelStore::adapters`]), and are never listed as models.
+//!
+//! Files a person brings ([`ModelStore::import`]) land in their own directory with a
+//! [`Provenance`] record next to them: a GGUF model in `<id>/`, an adapter in `adapters/<id>/`,
+//! a projector in `projectors/<id>/`, a safetensors model in `safetensors/<id>/` and an MLX
+//! model in `mlx/<id>/` ([`ModelStore::dir_models`]).
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::artifact::{Artifact, ArtifactFormat, ArtifactKind, PROVENANCE_FILE, Provenance, ProvenanceKind, inspect_staged};
 use crate::catalog::ModelSpec;
+use crate::download::Progress;
 use crate::hf::{AdapterFormat, Hub, adapter_hint, split_part};
 use crate::token::HfToken;
 
@@ -13,6 +20,15 @@ use crate::token::HfToken;
 pub const ADAPTERS_DIR: &str = "adapters";
 /// What [`download_adapter`](crate::download::download_adapter) records next to an adapter's files.
 pub const ADAPTER_INFO: &str = "adapter.json";
+/// The store's subdirectory for multimodal projectors: one directory per projector id.
+pub const PROJECTORS_DIR: &str = "projectors";
+/// The store's subdirectory for safetensors model directories (vLLM), one per model id.
+pub const SAFETENSORS_DIR: &str = "safetensors";
+/// The store's subdirectory for MLX model directories (MLX-LM), one per model id.
+pub const MLX_DIR: &str = "mlx";
+/// Directories [`ModelStore::import`] works in while it places files; never listed.
+const IMPORTING: &str = ".import-";
+const REPLACED: &str = ".replaced-";
 
 /// The public Hugging Face Hub.
 pub const HUB: &str = "https://huggingface.co";
@@ -37,6 +53,89 @@ pub struct StoredModel {
     pub size: u64,
     /// Every part of a split model is there.
     pub complete: bool,
+    /// How its files are laid out: GGUF files (from [`ModelStore::list`]), or a safetensors or
+    /// MLX directory (from [`ModelStore::dir_models`]).
+    #[serde(default)]
+    pub layout: ModelLayout,
+    /// Where it came from, for models placed by [`ModelStore::import`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+}
+
+/// [`StoredModel::layout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ModelLayout {
+    /// GGUF files, for llama.cpp.
+    #[default]
+    Gguf,
+    /// A safetensors directory (`safetensors/<id>/`), for vLLM.
+    Safetensors,
+    /// An MLX directory (`mlx/<id>/`), for MLX-LM.
+    Mlx,
+}
+
+/// A multimodal projector in the store, from [`ModelStore::projectors`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct StoredProjector {
+    /// Its directory's name under `projectors/`.
+    pub id: String,
+    /// The GGUF (llama.cpp `--mmproj`).
+    pub path: PathBuf,
+    pub size: u64,
+    /// The model it is for (its provenance's base), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+}
+
+/// What [`ModelStore::import`] placed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Imported {
+    Model(StoredModel),
+    Adapter(StoredAdapter),
+    Projector(StoredProjector),
+}
+
+impl Imported {
+    pub fn id(&self) -> &str {
+        match self {
+            Imported::Model(m) => &m.id,
+            Imported::Adapter(a) => &a.id,
+            Imported::Projector(p) => &p.id,
+        }
+    }
+
+    /// Bytes of its files.
+    pub fn size(&self) -> u64 {
+        match self {
+            Imported::Model(m) => m.size,
+            Imported::Adapter(a) => a.size,
+            Imported::Projector(p) => p.size,
+        }
+    }
+
+    pub fn provenance(&self) -> Option<&Provenance> {
+        match self {
+            Imported::Model(m) => m.provenance.as_ref(),
+            Imported::Adapter(a) => a.provenance.as_ref(),
+            Imported::Projector(p) => p.provenance.as_ref(),
+        }
+    }
+}
+
+/// Free and total bytes on the store's filesystem ([`ModelStore::disk_space`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DiskSpace {
+    /// Bytes this process may still write.
+    pub free: u64,
+    pub total: u64,
 }
 
 /// A LoRA adapter in the store, from [`ModelStore::adapters`].
@@ -58,6 +157,9 @@ pub struct StoredAdapter {
     pub repo: Option<String>,
     pub rank: Option<u32>,
     pub alpha: Option<f32>,
+    /// Where it came from, for adapters placed by [`ModelStore::import`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
 }
 
 /// `adapter.json`: a [`StoredAdapter`] without machine paths (the file name only).
@@ -105,15 +207,58 @@ fn is_adapter_gguf(path: &Path) -> bool {
     std::fs::File::open(path).ok().and_then(|f| crate::gguf::read_header(std::io::BufReader::new(f)).ok()).is_some_and(|h| h.kind.is_adapter())
 }
 
-/// Bytes of an adapter's files in `dir` (not `.part` files nor `adapter.json`).
+/// Bytes of an entry's files in `dir`, subdirectories too (not `.part` or hidden files, nor
+/// `adapter.json` or `provenance.json`).
 fn dir_size(dir: &Path) -> u64 {
-    std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) && !e.file_name().to_string_lossy().ends_with(".part") && e.file_name() != ADAPTER_INFO)
-        .filter_map(|e| e.metadata().ok().map(|m| m.len()))
-        .sum()
+    dir_files(dir, dir).iter().map(|(_, size)| size).sum()
+}
+
+/// An entry's files under `dir` (as in [`dir_size`]), as `/`-separated paths relative to `root`,
+/// sorted.
+fn dir_files(root: &Path, dir: &Path) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    collect_files(root, dir, 0, &mut out);
+    out.sort();
+    out
+}
+
+fn collect_files(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, u64)>) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Ok(ft) = e.file_type() else { continue };
+        if name.starts_with('.') || name.ends_with(".part") || name == ADAPTER_INFO || name == PROVENANCE_FILE {
+            continue;
+        }
+        if ft.is_dir() && depth < 3 {
+            collect_files(root, &e.path(), depth + 1, out);
+        } else if ft.is_file() {
+            let path = e.path();
+            let Ok(rel) = path.strip_prefix(root) else { continue };
+            let rel: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+            out.push((rel.join("/"), e.metadata().map(|m| m.len()).unwrap_or(0)));
+        }
+    }
+}
+
+/// A directory [`ModelStore::import`] is working in.
+fn is_work_dir(name: &str) -> bool {
+    name.starts_with(IMPORTING) || name.starts_with(REPLACED)
+}
+
+/// Moves `from` to `to`: a rename, or a copy then delete across filesystems.
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(from, to)?;
+    std::fs::File::open(to)?.sync_all()?;
+    std::fs::remove_file(from)
+}
+
+/// A name for a work directory next to the entry: unique within this process and time.
+fn work_name(prefix: &str, id: &str) -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("{prefix}{id}-{}-{nanos}", std::process::id())
 }
 
 impl ModelStore {
@@ -223,11 +368,18 @@ impl ModelStore {
             .map(|(key, (mut parts, of))| {
                 parts.sort();
                 let complete = parts.len() as u32 == of && parts[0].0 == 1;
+                let mut id = key.rsplit('/').next().unwrap_or(&key).to_string();
+                let provenance = self.provenance_of(&parts[0].1);
+                if let Some(p) = &provenance {
+                    id = p.id.clone();
+                }
                 StoredModel {
-                    id: key.rsplit('/').next().unwrap_or(&key).to_string(),
+                    id,
                     size: parts.iter().map(|p| p.2).sum(),
                     files: parts.into_iter().map(|p| p.1).collect(),
                     complete,
+                    layout: ModelLayout::Gguf,
+                    provenance,
                 }
             })
             .collect();
@@ -235,17 +387,36 @@ impl ModelStore {
         models
     }
 
+    /// The provenance record next to stored GGUF file `rel` (in its own directory, not the store
+    /// root) when the record lists that file.
+    fn provenance_of(&self, rel: &str) -> Option<Provenance> {
+        let (dir, file) = rel.rsplit_once('/')?;
+        let p = Provenance::read(&self.dir.join(dir))?;
+        (p.kind == ProvenanceKind::Model && !p.id.is_empty() && p.files.iter().any(|f| f.path == file)).then_some(p)
+    }
+
     /// Deletes a listed model's files (and their `.part` files) and the directories that leaves
-    /// empty. Returns the bytes freed. Paths outside the store are refused.
+    /// empty (with a provenance record left alone in one). Returns the bytes freed. Paths
+    /// outside the store are refused.
     pub fn remove_local(&self, model: &StoredModel) -> crate::Result<u64> {
         let mut freed = 0;
         for rel in &model.files {
             crate::hf::check_file(rel)?;
+        }
+        for rel in &model.files {
             let path = self.dir.join(rel);
             let _ = std::fs::remove_file(self.dir.join(format!("{rel}.part")));
             if let Ok(m) = std::fs::metadata(&path) {
                 std::fs::remove_file(&path)?;
                 freed += m.len();
+            }
+        }
+        for rel in &model.files {
+            let path = self.dir.join(rel);
+            if let Some(d) = path.parent().filter(|d| *d != self.dir)
+                && std::fs::read_dir(d).is_ok_and(|mut e| e.all(|e| e.is_ok_and(|e| e.file_name() == PROVENANCE_FILE)))
+            {
+                let _ = std::fs::remove_file(d.join(PROVENANCE_FILE));
             }
             let mut dir = path.parent().map(Path::to_path_buf);
             while let Some(d) = dir.filter(|d| d.starts_with(&self.dir) && *d != self.dir) {
@@ -276,7 +447,7 @@ impl ModelStore {
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && !e.file_name().to_string_lossy().starts_with('.'))
             .filter_map(|e| Self::adapter_in(&e.path(), &e.file_name().to_string_lossy()))
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -304,6 +475,7 @@ impl ModelStore {
             repo: None,
             rank: None,
             alpha: None,
+            provenance: Provenance::read(dir).filter(|p| p.kind == ProvenanceKind::Adapter),
         };
         match info {
             Some(i) => {
@@ -353,6 +525,340 @@ impl ModelStore {
     }
 }
 
+impl ModelStore {
+    /// The safetensors (`safetensors/<id>/`) and MLX (`mlx/<id>/`) model directories, sorted by
+    /// id. [`ModelStore::list`] has the GGUF models. A directory is complete when it has its
+    /// `config.json`.
+    pub fn dir_models(&self) -> Vec<StoredModel> {
+        let mut out = Vec::new();
+        for (sub, layout) in [(SAFETENSORS_DIR, ModelLayout::Safetensors), (MLX_DIR, ModelLayout::Mlx)] {
+            for e in std::fs::read_dir(self.dir.join(sub)).into_iter().flatten().flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || !e.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let files = dir_files(&self.dir, &e.path());
+                if files.is_empty() {
+                    continue;
+                }
+                out.push(StoredModel {
+                    id: name,
+                    size: files.iter().map(|f| f.1).sum(),
+                    complete: e.path().join("config.json").is_file(),
+                    files: files.into_iter().map(|f| f.0).collect(),
+                    layout,
+                    provenance: Provenance::read(&e.path()).filter(|p| p.kind == ProvenanceKind::Model),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.files.cmp(&b.files)));
+        out
+    }
+
+    /// Where an imported model of `layout` with id `id` goes: `<id>/` for GGUF,
+    /// `safetensors/<id>/` or `mlx/<id>/`. The id must be one plain path part.
+    pub fn model_dir(&self, layout: ModelLayout, id: &str) -> crate::Result<PathBuf> {
+        check_id(id)?;
+        Ok(match layout {
+            ModelLayout::Gguf => self.dir.join(id),
+            ModelLayout::Safetensors => self.dir.join(SAFETENSORS_DIR).join(id),
+            ModelLayout::Mlx => self.dir.join(MLX_DIR).join(id),
+        })
+    }
+
+    /// Where projector `id` goes: `<store>/projectors/<id>`.
+    pub fn projector_dir(&self, id: &str) -> crate::Result<PathBuf> {
+        check_id(id)?;
+        Ok(self.dir.join(PROJECTORS_DIR).join(id))
+    }
+
+    /// The projectors under `projectors/`, sorted by id: each directory's GGUF.
+    pub fn projectors(&self) -> Vec<StoredProjector> {
+        let mut out: Vec<StoredProjector> = std::fs::read_dir(self.dir.join(PROJECTORS_DIR))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && !e.file_name().to_string_lossy().starts_with('.'))
+            .filter_map(|e| {
+                let dir = e.path();
+                let path = std::fs::read_dir(&dir)
+                    .ok()?
+                    .flatten()
+                    .map(|f| f.path())
+                    .find(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("gguf")) && p.is_file())?;
+                let provenance = Provenance::read(&dir).filter(|p| p.kind == ProvenanceKind::Projector);
+                Some(StoredProjector {
+                    id: e.file_name().to_string_lossy().into_owned(),
+                    size: dir_size(&dir),
+                    for_model: provenance.as_ref().and_then(|p| p.base.as_ref()).and_then(|b| b.id.clone()),
+                    path,
+                    provenance,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// Deletes a stored projector's directory. Returns the bytes freed.
+    pub fn remove_projector(&self, projector: &StoredProjector) -> crate::Result<u64> {
+        let dir = self.projector_dir(&projector.id)?;
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let freed = dir_size(&dir);
+        std::fs::remove_dir_all(&dir)?;
+        let _ = std::fs::remove_dir(self.dir.join(PROJECTORS_DIR));
+        Ok(freed)
+    }
+
+    /// The store's directory, or its nearest existing parent.
+    fn existing_dir(&self) -> PathBuf {
+        let mut d = self.dir.clone();
+        while !d.exists() {
+            match d.parent() {
+                Some(p) => d = p.to_path_buf(),
+                None => break,
+            }
+        }
+        d
+    }
+
+    /// Free and total bytes on the filesystem the store is on (or would be on, before it
+    /// exists).
+    pub fn disk_space(&self) -> crate::Result<DiskSpace> {
+        let d = self.existing_dir();
+        Ok(DiskSpace { free: fs4::available_space(&d)?, total: fs4::total_space(&d)? })
+    }
+
+    /// Bytes this process may still write on the store's filesystem (0 when that can't be read,
+    /// so callers checking for room refuse rather than overfill).
+    pub fn free_bytes(&self) -> u64 {
+        self.disk_space().map(|d| d.free).unwrap_or(0)
+    }
+
+    /// Bytes of everything stored (models, model directories, adapters and projectors) whose
+    /// provenance has this origin ([`ORIGIN_UPLOAD`](crate::artifact::ORIGIN_UPLOAD) and so on).
+    pub fn bytes_by_origin(&self, origin: &str) -> u64 {
+        let of = |p: Option<&Provenance>| p.is_some_and(|p| p.origin == origin);
+        let models: u64 = self.list().iter().chain(self.dir_models().iter()).filter(|m| of(m.provenance.as_ref())).map(|m| m.size).sum();
+        let adapters: u64 = self.adapters().iter().filter(|a| of(a.provenance.as_ref())).map(|a| a.size).sum();
+        let projectors: u64 = self.projectors().iter().filter(|p| of(p.provenance.as_ref())).map(|p| p.size).sum();
+        models + adapters + projectors
+    }
+
+    /// Places files received into `staged` (under their artifact paths, as an upload stages them;
+    /// keep `staged` outside the store) into the store as `id`, with `provenance` next to them.
+    ///
+    /// The staged files are checked first: each must be in `artifact.files` with the same size
+    /// and SHA-256, and their headers must say what `artifact` says. The record's id, kind, files
+    /// and revision are then set from the bytes. Files are moved (copied across filesystems)
+    /// into a work directory next to the target, which is renamed into place last, so the entry
+    /// appears whole or not at all. An adapter also gets its `adapter.json`.
+    ///
+    /// Where it goes: a GGUF model in `<id>/`, an adapter in `adapters/<id>/`, a projector in
+    /// `projectors/<id>/`, a safetensors model in `safetensors/<id>/`, an MLX model in
+    /// `mlx/<id>/`. An id already in use is refused; see [`ModelStore::import_replacing`].
+    pub fn import(&self, staged: &Path, artifact: &Artifact, provenance: &Provenance, id: &str) -> crate::Result<Imported> {
+        self.import_with(staged, artifact, provenance, id, false, &mut |_| true)
+    }
+
+    /// [`ModelStore::import`], replacing an entry this store imported before under the same id
+    /// (models in the store's own GGUF files are never replaced).
+    pub fn import_replacing(&self, staged: &Path, artifact: &Artifact, provenance: &Provenance, id: &str) -> crate::Result<Imported> {
+        self.import_with(staged, artifact, provenance, id, true, &mut |_| true)
+    }
+
+    /// [`ModelStore::import`] with `replace` and a `progress` callback for the hash check
+    /// (`false` cancels).
+    pub fn import_with(
+        &self,
+        staged: &Path,
+        artifact: &Artifact,
+        provenance: &Provenance,
+        id: &str,
+        replace: bool,
+        progress: &mut dyn FnMut(Progress) -> bool,
+    ) -> crate::Result<Imported> {
+        check_id(id)?;
+        let dest = self.dest(artifact, id)?;
+        self.check_free(artifact, id, &dest, replace)?;
+        let found = inspect_staged(staged, &artifact.files, progress)?;
+        if (found.kind, found.format, &found.revision) != (artifact.kind, artifact.format, &artifact.revision) {
+            return Err(crate::Error::Model(format!("{id}: the staged files are not what was described")));
+        }
+        self.place(staged, &found, provenance, id, replace)
+    }
+
+    /// [`ModelStore::import_with`] for files known only by their list (an upload's offer): what
+    /// they are comes from their headers, read once with the hash check. The entry's kind and
+    /// format are in the returned [`Imported`].
+    pub fn import_files(
+        &self,
+        staged: &Path,
+        files: &[crate::artifact::ArtifactFile],
+        provenance: &Provenance,
+        id: &str,
+        replace: bool,
+        progress: &mut dyn FnMut(Progress) -> bool,
+    ) -> crate::Result<Imported> {
+        check_id(id)?;
+        let found = inspect_staged(staged, files, progress)?;
+        self.place(staged, &found, provenance, id, replace)
+    }
+
+    /// Moves checked staged files into place (see [`ModelStore::import`]).
+    fn place(&self, staged: &Path, found: &Artifact, provenance: &Provenance, id: &str, replace: bool) -> crate::Result<Imported> {
+        let dest = self.dest(found, id)?;
+        self.check_free(found, id, &dest, replace)?;
+        let mut record = provenance.clone();
+        record.id = id.to_string();
+        record.kind = found.kind.provenance_kind();
+        record.files = found.files.clone();
+        record.revision = found.revision.clone();
+
+        let parent = dest.parent().ok_or_else(|| crate::Error::Model(format!("{id}: no parent directory")))?;
+        std::fs::create_dir_all(parent)?;
+        let work = parent.join(work_name(IMPORTING, id));
+        let placed = (|| -> crate::Result<()> {
+            std::fs::create_dir(&work)?;
+            for f in &found.files {
+                let to = work.join(&f.path);
+                if let Some(d) = to.parent() {
+                    std::fs::create_dir_all(d)?;
+                }
+                move_file(&staged.join(&f.path), &to)?;
+            }
+            record.write(&work)?;
+            if let ArtifactKind::Adapter { format } = found.kind {
+                let mut a = self.adapter_record(found, format, id, &work);
+                a.path = match format {
+                    AdapterFormat::GgufLora => dest.join(&found.files[0].path),
+                    _ => dest.clone(),
+                };
+                write_adapter_info(&work, &a)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = placed {
+            // Give the staged files back so the upload can be retried without sending them again.
+            for f in &found.files {
+                let at = work.join(&f.path);
+                if at.exists() {
+                    let _ = move_file(&at, &staged.join(&f.path));
+                }
+            }
+            let _ = std::fs::remove_dir_all(&work);
+            return Err(e);
+        }
+        let old = parent.join(work_name(REPLACED, id));
+        let had_old = replace && dest.exists();
+        if had_old {
+            std::fs::rename(&dest, &old)?;
+        }
+        if let Err(e) = std::fs::rename(&work, &dest) {
+            if had_old {
+                let _ = std::fs::rename(&old, &dest);
+            }
+            let _ = std::fs::remove_dir_all(&work);
+            return Err(e.into());
+        }
+        if had_old {
+            let _ = std::fs::remove_dir_all(&old);
+        }
+        Ok(self.imported(found, id, &dest, record))
+    }
+
+    /// Where an artifact stored as `id` goes.
+    fn dest(&self, artifact: &Artifact, id: &str) -> crate::Result<PathBuf> {
+        match (artifact.kind, artifact.format) {
+            (ArtifactKind::Adapter { .. }, _) => self.adapter_dir(id),
+            (ArtifactKind::Projector, _) => self.projector_dir(id),
+            (_, ArtifactFormat::Safetensors) => self.model_dir(ModelLayout::Safetensors, id),
+            (_, ArtifactFormat::Mlx) => self.model_dir(ModelLayout::Mlx, id),
+            _ => self.model_dir(ModelLayout::Gguf, id),
+        }
+    }
+
+    /// Refuses an id in use (unless `replace` and the entry at `dest` was imported) and a
+    /// target that a model's own GGUF files are in.
+    fn check_free(&self, artifact: &Artifact, id: &str, dest: &Path, replace: bool) -> crate::Result<()> {
+        let taken = |what: &str| crate::Error::Model(format!("{id} exists ({what}); remove it first or replace it"));
+        let imported_here = Provenance::read(dest).is_some();
+        if dest.exists() && !(replace && imported_here) {
+            return Err(taken("its directory is in use"));
+        }
+        let model = artifact.kind == ArtifactKind::Model;
+        if model
+            && self.list().iter().chain(self.dir_models().iter()).any(|m| m.id == id && !m.files.iter().all(|f| self.dir.join(f).starts_with(dest)))
+        {
+            return Err(taken("a stored model has that id"));
+        }
+        Ok(())
+    }
+
+    fn adapter_record(&self, found: &Artifact, format: AdapterFormat, id: &str, dir: &Path) -> StoredAdapter {
+        StoredAdapter {
+            id: id.to_string(),
+            format,
+            path: dir.to_path_buf(),
+            size: found.size(),
+            base_model: found.base_model.clone(),
+            architecture: found.architecture.clone(),
+            repo: None,
+            rank: found.rank,
+            alpha: found.alpha,
+            provenance: None,
+        }
+    }
+
+    fn imported(&self, found: &Artifact, id: &str, dest: &Path, record: Provenance) -> Imported {
+        let rel = |f: &str| {
+            let full = dest.join(f);
+            let rel: Vec<String> =
+                full.strip_prefix(&self.dir).unwrap_or(&full).components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+            rel.join("/")
+        };
+        match found.kind {
+            ArtifactKind::Adapter { format } => {
+                let mut a = self.adapter_record(found, format, id, dest);
+                if format == AdapterFormat::GgufLora {
+                    a.path = dest.join(&found.files[0].path);
+                }
+                a.provenance = Some(record);
+                Imported::Adapter(a)
+            }
+            ArtifactKind::Projector => Imported::Projector(StoredProjector {
+                id: id.to_string(),
+                path: dest.join(&found.files[0].path),
+                size: found.size(),
+                for_model: record.base.as_ref().and_then(|b| b.id.clone()),
+                provenance: Some(record),
+            }),
+            _ => Imported::Model(StoredModel {
+                id: id.to_string(),
+                files: found.files.iter().map(|f| rel(&f.path)).collect(),
+                size: found.size(),
+                complete: true,
+                layout: match found.format {
+                    ArtifactFormat::Safetensors => ModelLayout::Safetensors,
+                    ArtifactFormat::Mlx => ModelLayout::Mlx,
+                    _ => ModelLayout::Gguf,
+                },
+                provenance: Some(record),
+            }),
+        }
+    }
+}
+
+/// An entry id: one plain path part, not hidden.
+fn check_id(id: &str) -> crate::Result<()> {
+    if id.contains('/') || id.starts_with('.') || crate::hf::check_file(id).is_err() {
+        return Err(crate::Error::Model(format!("{id:?} is not a valid id (one plain name, no '/', not hidden)")));
+    }
+    Ok(())
+}
+
 /// A file of a stored model: part number, path relative to the store, size.
 type Part = (u32, String, u64);
 
@@ -362,7 +868,8 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, u64)>) {
     for e in entries.flatten() {
         let Ok(ft) = e.file_type() else { continue };
         let path = e.path();
-        if ft.is_dir() && depth == 0 && e.file_name() == ADAPTERS_DIR {
+        let skip = [ADAPTERS_DIR, PROJECTORS_DIR, SAFETENSORS_DIR, MLX_DIR];
+        if ft.is_dir() && ((depth == 0 && skip.iter().any(|d| e.file_name() == *d)) || is_work_dir(&e.file_name().to_string_lossy())) {
             continue;
         } else if ft.is_dir() && depth < 4 {
             walk(root, &path, depth + 1, out);
@@ -475,5 +982,173 @@ mod tests {
     #[test]
     fn a_mirror_loses_its_trailing_slash() {
         assert_eq!(ModelStore::new("/x").with_hub("http://127.0.0.1:1/").hub(), "http://127.0.0.1:1");
+    }
+
+    mod import {
+        use super::*;
+        use crate::artifact::tests::{model_gguf, safetensors};
+        use crate::artifact::{ORIGIN_TRAIN, ORIGIN_UPLOAD, ProvenanceBase, inspect};
+
+        fn stage(dir: &Path, files: &[(&str, Vec<u8>)]) -> Artifact {
+            for (name, body) in files {
+                let p = dir.join(name);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, body).unwrap();
+            }
+            let paths: Vec<PathBuf> =
+                if files.len() == 1 && !files[0].0.contains('/') { vec![dir.join(files[0].0)] } else { vec![dir.to_path_buf()] };
+            inspect(&paths).unwrap()
+        }
+
+        #[test]
+        fn a_gguf_model_lands_in_its_own_directory_with_provenance() {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ModelStore::new(tmp.path().join("store"));
+            let staged = tmp.path().join("up");
+            let a = stage(&staged, &[("tune-Q4_0.gguf", model_gguf(&[]))]);
+            let p = Provenance::new(ORIGIN_UPLOAD).with_license("apache-2.0");
+            let got = store.import(&staged, &a, &p, "support-r3").unwrap();
+            let Imported::Model(m) = &got else { panic!("{got:?}") };
+            assert_eq!(
+                (m.id.as_str(), m.files.as_slice(), m.layout),
+                ("support-r3", &["support-r3/tune-Q4_0.gguf".to_string()][..], ModelLayout::Gguf)
+            );
+            assert!(!staged.join("tune-Q4_0.gguf").exists(), "moved, not copied");
+            let listed = store.list();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(&listed[0], m, "list reads the same entry back");
+            let rec = listed[0].provenance.as_ref().unwrap();
+            assert_eq!((rec.revision.as_str(), rec.license.as_deref(), rec.kind), (a.revision.as_str(), Some("apache-2.0"), ProvenanceKind::Model));
+            assert_eq!(store.bytes_by_origin(ORIGIN_UPLOAD), a.size());
+            assert_eq!(store.bytes_by_origin(ORIGIN_TRAIN), 0);
+
+            let again = tmp.path().join("again");
+            let b = stage(&again, &[("tune-Q4_0.gguf", model_gguf(&[("general.name", serde_json::json!("v2"))]))]);
+            assert!(store.import(&again, &b, &p, "support-r3").unwrap_err().to_string().contains("exists"));
+            assert!(again.join("tune-Q4_0.gguf").exists(), "a refusal keeps the staged files");
+            let replaced = store.import_replacing(&again, &b, &p, "support-r3").unwrap();
+            assert_eq!(replaced.provenance().unwrap().revision, b.revision);
+            assert_eq!(store.list().len(), 1);
+
+            assert_eq!(store.remove_local(&store.list()[0]).unwrap(), b.size());
+            assert!(!tmp.path().join("store/support-r3").exists(), "the provenance record goes with the files");
+        }
+
+        #[test]
+        fn an_id_used_by_a_stored_model_or_bad_ids_are_refused() {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ModelStore::new(tmp.path().join("store"));
+            std::fs::create_dir_all(store.dir()).unwrap();
+            std::fs::write(store.dir().join("m-Q4_0.gguf"), model_gguf(&[])).unwrap();
+            let staged = tmp.path().join("up");
+            let a = stage(&staged, &[("x.gguf", model_gguf(&[]))]);
+            let p = Provenance::new(ORIGIN_UPLOAD);
+            assert!(store.import_replacing(&staged, &a, &p, "m-Q4_0").unwrap_err().to_string().contains("exists"));
+            for bad in ["a/b", "..", ".hidden", ""] {
+                assert!(store.import(&staged, &a, &p, bad).is_err(), "{bad}");
+            }
+        }
+
+        #[test]
+        fn files_known_by_their_list_are_classified_from_their_headers() {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ModelStore::new(tmp.path().join("store"));
+            let staged = tmp.path().join("up");
+            let a = stage(&staged, &[("tune-LoRA.gguf", crate::gguf::lora_header("llama"))]);
+            let got = store.import_files(&staged, &a.files, &Provenance::new(ORIGIN_UPLOAD), "tune", false, &mut |_| true).unwrap();
+            assert!(matches!(&got, Imported::Adapter(ad) if ad.format == AdapterFormat::GgufLora));
+            assert_eq!(got.provenance().unwrap().kind, ProvenanceKind::Adapter);
+        }
+
+        #[test]
+        fn tampered_staged_files_are_refused() {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ModelStore::new(tmp.path().join("store"));
+            let staged = tmp.path().join("up");
+            let a = stage(&staged, &[("x.gguf", model_gguf(&[]))]);
+            let mut body = std::fs::read(staged.join("x.gguf")).unwrap();
+            *body.last_mut().unwrap() ^= 1;
+            std::fs::write(staged.join("x.gguf"), body).unwrap();
+            assert!(matches!(store.import(&staged, &a, &Provenance::new(ORIGIN_UPLOAD), "x"), Err(crate::Error::Checksum { .. })));
+            assert!(store.list().is_empty());
+        }
+
+        #[test]
+        fn adapters_get_adapter_json_and_their_size_leaves_provenance_out() {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ModelStore::new(tmp.path().join("store"));
+            let staged = tmp.path().join("up");
+            let a = stage(&staged, &[("tune-LoRA.gguf", crate::gguf::lora_header("llama"))]);
+            let mut p = Provenance::new(ORIGIN_TRAIN);
+            p.base = Some(ProvenanceBase { id: Some("qwen3-8b".into()), ..Default::default() });
+            let got = store.import(&staged, &a, &p, "tune").unwrap();
+            let Imported::Adapter(ad) = got else { panic!() };
+            assert_eq!((ad.format, ad.architecture.as_deref(), ad.alpha), (AdapterFormat::GgufLora, Some("llama"), Some(32.5)));
+            let listed = store.adapters();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].path, store.dir().join("adapters/tune/tune-LoRA.gguf"));
+            assert_eq!(listed[0].size, a.size(), "adapter.json and provenance.json are not counted");
+            assert_eq!(listed[0].provenance.as_ref().unwrap().base.as_ref().unwrap().id.as_deref(), Some("qwen3-8b"));
+            assert!(store.dir().join("adapters/tune/adapter.json").is_file());
+            assert!(store.list().is_empty(), "adapters are not models");
+
+            let peft = tmp.path().join("peft");
+            let b = stage(
+                &peft,
+                &[
+                    ("adapter_config.json", br#"{"peft_type":"LORA","r":8,"lora_alpha":16,"base_model_name_or_path":"Org/B"}"#.to_vec()),
+                    ("adapter_model.safetensors", safetensors(3, None)),
+                ],
+            );
+            store.import(&peft, &b, &Provenance::new(ORIGIN_UPLOAD), "peft").unwrap();
+            let peft = store.adapters().into_iter().find(|a| a.id == "peft").unwrap();
+            assert_eq!((peft.format, peft.rank, peft.path.clone()), (AdapterFormat::Peft, Some(8), store.dir().join("adapters/peft")));
+        }
+
+        #[test]
+        fn safetensors_and_mlx_directories_and_projectors_have_their_own_layouts() {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ModelStore::new(tmp.path().join("store"));
+            let hf = tmp.path().join("hf");
+            let a = stage(&hf, &[("config.json", br#"{"architectures":["X"]}"#.to_vec()), ("model.safetensors", safetensors(2, None))]);
+            store.import(&hf, &a, &Provenance::new(ORIGIN_UPLOAD), "x-st").unwrap();
+            let mlx = tmp.path().join("mlx");
+            let b = stage(
+                &mlx,
+                &[
+                    ("config.json", br#"{"architectures":["X"]}"#.to_vec()),
+                    ("model.safetensors", safetensors(2, Some(serde_json::json!({"format":"mlx"})))),
+                ],
+            );
+            store.import(&mlx, &b, &Provenance::new(ORIGIN_UPLOAD), "x-mlx").unwrap();
+            let dirs = store.dir_models();
+            assert_eq!(
+                dirs.iter().map(|m| (m.id.as_str(), m.layout, m.complete)).collect::<Vec<_>>(),
+                [("x-mlx", ModelLayout::Mlx, true), ("x-st", ModelLayout::Safetensors, true)]
+            );
+            assert_eq!(dirs[1].files, ["safetensors/x-st/config.json", "safetensors/x-st/model.safetensors"]);
+            assert!(store.list().is_empty(), "GGUF list only");
+
+            let mm = tmp.path().join("mm");
+            let c = stage(&mm, &[("mmproj-F16.gguf", crate::gguf::header(&[("general.architecture", serde_json::json!("clip"))]))]);
+            let mut p = Provenance::new(ORIGIN_UPLOAD);
+            p.base = Some(ProvenanceBase { id: Some("x-st".into()), ..Default::default() });
+            store.import(&mm, &c, &p, "vision").unwrap();
+            let proj = store.projectors();
+            assert_eq!((proj[0].id.as_str(), proj[0].for_model.as_deref()), ("vision", Some("x-st")));
+            assert_eq!(store.remove_projector(&proj[0]).unwrap(), c.size());
+            assert_eq!(store.remove_local(&dirs[0]).unwrap(), b.size());
+            assert!(!store.dir().join("mlx/x-mlx").exists());
+            assert_eq!(store.bytes_by_origin(ORIGIN_UPLOAD), a.size());
+        }
+
+        #[test]
+        fn disk_space_is_read_before_the_store_exists() {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ModelStore::new(tmp.path().join("not/yet"));
+            let d = store.disk_space().unwrap();
+            assert!(d.total >= d.free && d.total > 0);
+            assert!(store.free_bytes() > 0);
+        }
     }
 }

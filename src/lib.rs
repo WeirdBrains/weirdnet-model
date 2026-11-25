@@ -1,5 +1,9 @@
 //! Weirdnet local models.
 //!
+//! - [`artifact`]: inspect and hash model files a person brings (GGUF models, split models,
+//!   LoRA adapters and projectors; safetensors and MLX model directories; PEFT adapters),
+//!   refusing pickles, code and symlinks, and the [`Provenance`] record kept next to them;
+//!   [`ModelStore::import`] places them in the store.
 //! - [`catalog`]: pinned Gemma 4 E2B and E4B GGUF files (Hugging Face repo, file, size, SHA-256).
 //! - [`store`] and [`mod@download`]: where model files and LoRA adapters live (list and remove
 //!   them too), and a consent-gated download that resumes a `.part` file and checks size and
@@ -23,6 +27,7 @@
 //! Nothing here knows an app: callers pass paths, consent and callbacks.
 #![forbid(unsafe_code)]
 
+pub mod artifact;
 pub mod catalog;
 pub mod cpu;
 pub mod download;
@@ -42,11 +47,12 @@ pub mod agent;
 #[cfg(feature = "llama")]
 pub mod llama;
 
+pub use artifact::{Artifact, ArtifactFile, ArtifactFormat, ArtifactKind, Provenance, inspect};
 pub use catalog::{Device, ModelSpec, human};
 pub use download::{Consent, Progress, download, download_adapter, download_parts};
 pub use hf::{AdapterFormat, Hub, RepoAdapter};
 pub use prompt::{ChatMessage, ChatRole};
-pub use store::{ModelStore, StoredAdapter, StoredModel};
+pub use store::{DiskSpace, Imported, ModelLayout, ModelStore, StoredAdapter, StoredModel, StoredProjector};
 pub use token::HfToken;
 pub use worker::{Chunk, Engine, GenerateRequest, Generation, Stats, Worker};
 

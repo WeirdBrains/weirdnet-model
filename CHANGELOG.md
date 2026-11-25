@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- `artifact`: `inspect` reads and hashes local model files (GGUF models, split models, LoRA adapters and projectors; safetensors and MLX model directories; PEFT adapters) and refuses pickles, code and symlinks; `Artifact`, `ArtifactKind`, `ArtifactFormat`, `ArtifactFile`, `revision`, `read_safetensors`, `early_header`, `inspect_staged`.
+- `Provenance` (`provenance.json`, `weirdnet-provenance/1`) with base, dataset, trainer and app fields.
+- `ModelStore::import` (and `import_replacing`, `import_with`, `import_files`): verified, atomic placement with provenance, including `safetensors/<id>/`, `mlx/<id>/` and `projectors/<id>/` layouts; `dir_models`, `projectors`, `remove_projector`, `free_bytes`, `disk_space`, `bytes_by_origin`.
+- `StoredModel::provenance` and `layout`, `StoredAdapter::provenance`; `GgufKind::Projector`.
+
+### Changed
+
+- `gguf::read_header` reports projector GGUFs as `GgufKind::Projector` instead of a model.
+- An adapter's size leaves `provenance.json` out, as it does `adapter.json`.
+
 ## [0.5.2] - 2026-11-22
 
 ### Added

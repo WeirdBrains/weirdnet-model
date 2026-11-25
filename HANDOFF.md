@@ -2,6 +2,23 @@
 
 Running log for [weirdnet-model](https://github.com/WeirdBrains/weirdnet-model), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-24: model uploads (artifact inspection, import, provenance)
+
+What changed (on main, for release 0.5.3; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`), the model side of the [model upload plan](https://github.com/WeirdBrains/ymir/blob/feature/model-upload-plan/docs/design/model-upload.md), for uploads in [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends):
+
+- `artifact`: `inspect` / `inspect_with` / `inspect_staged` read model files and folders made elsewhere into an `Artifact` (`ArtifactKind`: model, adapter, projector; `ArtifactFormat`: GGUF with its split parts, safetensors, MLX; `ArtifactFile` with SHA-256 hashed while streaming; a content `revision`). GGUF, PEFT (`adapter_config.json` + `adapter_model.safetensors`), Hugging Face safetensors (`config.json`, sharded with an index that must cover every shard) and MLX folders are accepted; pickles, `.py` files, symlinks, other extensions and paths that leave the folder are refused with `Error::Model`. `read_safetensors` and `early_header` check headers from the first bytes. There is no PEFT format variant: adapters reuse `hf::AdapterFormat`.
+- `Provenance` (`provenance.json`, format `weirdnet-provenance/1`): origin, license, base, dataset, trainer, uploader and time, unknown fields kept. `StoredModel` and `StoredAdapter` carry it; `StoredModel::layout` (`ModelLayout`). An adapter's size leaves `provenance.json` out.
+- `gguf`: `GgufKind::Projector` for vision projector files (`general.type` = `mmproj` or the `clip` architecture).
+- `ModelStore`: `import`, `import_replacing`, `import_with` and `import_files` (inspects once) move staged files into place (GGUF models in `<id>/` under their own names, `adapters/`, `projectors/`, `safetensors/`, `mlx/`), write `provenance.json` (and `adapter.json` for adapters), roll back on failure and swap atomically on replace. `dir_models`, `model_dir`, `projectors`, `projector_dir`, `remove_projector`, `disk_space`, `free_bytes`, `bytes_by_origin`. Staging for partial uploads lives outside the store (the caller's choice).
+
+Release approval: m3talsmith approved publishing 0.5.3 to crates.io once main is green (2026-11-24, 9:21 PM ET), together with weirdnet-backends 0.4.4.
+
+Checks run: the `release.toml` checks (fmt; clippy `-D warnings` with `llama,agent`; tests with `llama,agent`, 91 passed, 2 ignored; `cargo doc -D warnings`); `cargo semver-checks` against 0.5.2 with `llama,agent` (no semver update required). Tests use temporary folders with generated GGUF, safetensors, PEFT and MLX files.
+
+Not tested: real Hugging Face, MLX or PEFT checkpoints from training tools; very large files (multi-GB) and imports across filesystems (the copy fallback runs only when rename fails); Windows and macOS.
+
+What's left and next: release 0.5.3, then weirdnet-backends 0.4.4 (upload, fetch and peer pull in `models/1`) moves to `weirdnet-model = "0.5.3"`. Device roles in weirdnet-sync grants are already free-form app strings, so no sync or agent change is needed; m3talsmith chose that any linked device may upload, so no any-of-roles helper was added to `RosterAuth`.
+
 ## 2026-11-22: LoRA adapters merged to main
 
 What changed: fast-forwards main to [lora-adapters](https://github.com/WeirdBrains/weirdnet-model/tree/lora-adapters) (`78711f0`); main is ready for 0.5.2, not released. No code changes in the merge.

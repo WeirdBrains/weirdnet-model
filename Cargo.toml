@@ -29,6 +29,7 @@ agent = ["dep:weirdnet-agent", "dep:async-trait"]
 
 [dependencies]
 dirs = "6"
+fs4 = "1"
 minijinja = { version = "3", features = ["json", "loop_controls"] }
 minijinja-contrib = { version = "3", features = ["pycompat"] }
 serde = { version = "1", features = ["derive"] }

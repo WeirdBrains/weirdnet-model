@@ -110,6 +110,51 @@ leave adapter repos out unless `Search::with_adapters(true)`. Adapters download 
 `adapters/<id>/` under the store with the same consent, resume and SHA-256 checks as models, plus
 an `adapter.json` with the repo, format and base model (no paths).
 
+## Your own model files
+
+For weights a person brings themselves (a fine-tune made on another machine, a trainer's
+output), `artifact::inspect` reads and hashes the files and `ModelStore::import` places them in
+the store with a provenance record next to them.
+
+```rust
+use std::path::PathBuf;
+use weirdnet_model::artifact::{self, ORIGIN_UPLOAD, Provenance};
+use weirdnet_model::{Imported, ModelStore};
+
+let store = ModelStore::from_env();
+// One directory, or files one by one (a GGUF, every part of a split GGUF).
+let found = artifact::inspect(&[PathBuf::from("out/qwen3-8b-support-r3.Q4_K_M.gguf")])?;
+println!("{:?} {:?} {:?} {}", found.kind, found.format, found.architecture, found.revision);
+let record = Provenance::for_artifact(&found, "support-r3", ORIGIN_UPLOAD).with_license("apache-2.0");
+// `staged` holds the files under their artifact paths, outside the store (an upload's parts).
+let staged = PathBuf::from("/tmp/upload-staging");
+match store.import(&staged, &found, &record, "support-r3")? {
+    Imported::Model(m) => println!("{} in {:?}", m.id, m.files),
+    other => println!("{other:?}"),
+}
+println!("{} bytes free, {} bytes uploaded", store.free_bytes(), store.bytes_by_origin(ORIGIN_UPLOAD));
+```
+
+What `inspect` accepts: GGUF models (split ones with every part), GGUF LoRA adapters and
+multimodal projectors (`GgufKind::Projector`: `general.type` = `mmproj` or the `clip`
+architecture), safetensors model directories (`config.json` with `architectures`, an index that
+covers every shard), MLX directories (MLX-LM's `format` = `mlx` metadata or a `quantization`
+block in `config.json`) and PEFT LoRA directories. Weights are data, never code: pickled weights
+(`.bin`, `.pt`, `.pth`, `.ckpt`, `.pkl`), Python files and other code are refused, and so are
+symlinks, hidden files given by name and anything that isn't a regular file. Headers are read
+with size caps before anything is hashed; `artifact::early_header` checks a header from the
+first bytes of a file still being received. The revision is `sha256:` and the first 16 hex
+digits of the SHA-256 of the sorted `path:sha256` lines.
+
+`import` checks the staged files against the artifact (size, SHA-256 and headers), sets the
+record's id, kind, files and revision from the bytes, moves the files into a work directory
+next to the target and renames it into place last. Layout: a GGUF model in `<id>/`, an adapter in
+`adapters/<id>/` (with its `adapter.json`), a projector in `projectors/<id>/`, a safetensors
+model in `safetensors/<id>/` and an MLX model in `mlx/<id>/`. `list` keeps listing GGUF models
+(an imported one under its id, with `provenance`); `dir_models` lists the safetensors and MLX
+directories, `projectors` the projectors. An adapter's `size` leaves `adapter.json` and
+`provenance.json` out. `free_bytes` and `disk_space` read the store's filesystem.
+
 ## CPU support
 
 llama.cpp's build turns on AVX, AVX2, BMI2, FMA and F16C by default, so a plain `llama` build runs

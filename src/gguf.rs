@@ -52,6 +52,9 @@ pub enum GgufKind {
         /// `adapter.lora.alpha`, when set.
         alpha: Option<f32>,
     },
+    /// A multimodal projector (`general.type` is `mmproj`, or the `clip` architecture), the
+    /// file llama.cpp's `--mmproj` takes next to a model.
+    Projector,
 }
 
 impl GgufKind {
@@ -62,6 +65,10 @@ impl GgufKind {
 
     pub fn is_adapter(&self) -> bool {
         matches!(self, GgufKind::Adapter { .. })
+    }
+
+    pub fn is_projector(&self) -> bool {
+        matches!(self, GgufKind::Projector)
     }
 }
 
@@ -266,8 +273,9 @@ pub fn hub_id(url: &str) -> Option<String> {
     crate::hf::check_repo(id).ok().map(|_| id.to_string())
 }
 
-/// Reads a GGUF header of any kind: a model (with its KV shape when the header has it) or an
-/// adapter (`general.type` = `adapter`, with `adapter.type` and `adapter.lora.alpha`). Unlike
+/// Reads a GGUF header of any kind: a model (with its KV shape when the header has it), an
+/// adapter (`general.type` = `adapter`, with `adapter.type` and `adapter.lora.alpha`) or a
+/// multimodal projector (`general.type` = `mmproj`, or architecture `clip`). Unlike
 /// [`read_info`] it doesn't fail on adapters.
 pub fn read_header(r: impl Read) -> Result<GgufHeader> {
     let kv = read_kv(r)?;
@@ -285,9 +293,11 @@ pub fn read_header(r: impl Read) -> Result<GgufHeader> {
                 _ => None,
             },
         },
+        Some("mmproj") => GgufKind::Projector,
+        _ if architecture == "clip" => GgufKind::Projector,
         _ => GgufKind::Model,
     };
-    let info = if kind.is_adapter() { None } else { info_from(&kv).ok() };
+    let info = if matches!(kind, GgufKind::Model) { info_from(&kv).ok() } else { None };
     let base_model = text("general.base_model.0.repo_url").and_then(|u| hub_id(&u));
     let repo = text("general.source.repo_url").or_else(|| text("general.repo_url")).and_then(|u| hub_id(&u));
     Ok(GgufHeader { kind, architecture, base_model, repo, info })
@@ -443,5 +453,14 @@ mod tests {
         let h = header(&[("general.architecture", json!("x")), ("x.block_count", json!(3))]);
         assert!(read_info(&h[..h.len() - 2]).is_err());
         assert!(read_info(&h[..]).is_err(), "no head size");
+    }
+
+    #[test]
+    fn projectors_are_their_own_kind() {
+        let typed = header(&[("general.architecture", json!("clip")), ("general.type", json!("mmproj"))]);
+        let h = read_header(&typed[..]).unwrap();
+        assert!(h.kind.is_projector() && !h.kind.is_adapter() && h.info.is_none());
+        let untyped = header(&[("general.architecture", json!("clip"))]);
+        assert_eq!(read_header(&untyped[..]).unwrap().kind, GgufKind::Projector);
     }
 }

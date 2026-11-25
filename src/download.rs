@@ -211,6 +211,7 @@ pub fn download_adapter(
         repo: Some(repo.to_string()),
         rank: adapter.rank,
         alpha: adapter.alpha,
+        provenance: None,
     };
     crate::store::write_adapter_info(&dir, &info)?;
     Ok(path)
