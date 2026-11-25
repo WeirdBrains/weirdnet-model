@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-24
+
 ### Added
 
 - `artifact`: `inspect` reads and hashes local model files (GGUF models, split models, LoRA adapters and projectors; safetensors and MLX model directories; PEFT adapters) and refuses pickles, code and symlinks; `Artifact`, `ArtifactKind`, `ArtifactFormat`, `ArtifactFile`, `revision`, `read_safetensors`, `early_header`, `inspect_staged`.
