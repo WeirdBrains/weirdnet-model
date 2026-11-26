@@ -22,6 +22,24 @@ jobs:
       - run: cargo test --locked --features llama,agent
       - run: RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --features llama,agent
       - run: cargo package --locked
+  platforms:
+    # macOS and Windows: the same checks without the slow cpu-dispatch build. llama.cpp builds
+    # from source with the runner's cmake and C++ compiler (Xcode clang, MSVC).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo test --locked --no-default-features --features agent
+      - run: cargo clippy --locked --all-targets --features llama,agent -- -D warnings
+      - run: cargo test --locked --features llama,agent
   cpu-dispatch:
     # ggml built for every CPU level as shared libraries (slow: one CPU library per level).
     runs-on: ubuntu-24.04

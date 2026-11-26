@@ -2,6 +2,16 @@
 
 Running log for [weirdnet-model](https://github.com/WeirdBrains/weirdnet-model), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-26: CI on macOS and Windows
+
+What changed: [CI](.github/workflows/ci.yml) gets a `platforms` job on `macos-latest` and `windows-latest`: clippy `-D warnings` and tests with default features, tests with `agent` only, and clippy and tests with `llama,agent` (llama.cpp built from source with the runner's compiler). Linux keeps the full `check` and `cpu-dispatch` jobs.
+
+Checks run: none locally for this commit (workflow only); the first run on main is the check.
+
+Not tested: `cpu-dispatch`, Vulkan and Metal on macOS and Windows.
+
+What's left and next: the speech-to-text catalog entry and measured model limits for the [video design](https://github.com/WeirdBrains/ymir/blob/feature/video-upload/docs/design/video.md), then release 0.5.4.
+
 ## 2026-11-24: release 0.5.3
 
 What changed: release `v0.5.3` (tag [v0.5.3](https://github.com/WeirdBrains/weirdnet-model/releases/tag/v0.5.3), the `release: v0.5.3` commit right after this entry). It ships the model upload work below (`a3c3ad1`) to [crates.io](https://crates.io/crates/weirdnet-model/0.5.3); docs at [docs.rs](https://docs.rs/weirdnet-model/0.5.3).
