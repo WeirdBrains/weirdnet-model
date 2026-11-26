@@ -2,6 +2,18 @@
 
 Running log for [weirdnet-model](https://github.com/WeirdBrains/weirdnet-model), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-26: release 0.5.4
+
+What changed: release `v0.5.4` (tag [v0.5.4](https://github.com/WeirdBrains/weirdnet-model/releases/tag/v0.5.4), the `release: v0.5.4` commit right after this entry). It ships speech to text and measured model limits (`86980ef`, entry below) and CI on macOS and Windows (`5a70d34`) to [crates.io](https://crates.io/crates/weirdnet-model/0.5.4); docs at [docs.rs](https://docs.rs/weirdnet-model/0.5.4).
+
+Release approval: m3talsmith approved patch releases without asking ("Don't ask about publishing").
+
+Checks run: CI green on `86980ef` (Linux check and cpu-dispatch, macOS, Windows); `cargo semver-checks` against 0.5.3 with `agent` and with `llama,agent` (no semver update required); the release script's checks from [release.toml](release.toml) (fmt, clippy `-D warnings` and tests with `llama,agent`, `cargo doc -D warnings`), then `cargo publish`.
+
+Not tested: as in the entry below.
+
+What's left and next: as in the entry below (weirdnet-agent `Transcribe` purpose and route; weirdnet-backends measuring limits at load and calling the transcriber).
+
 ## 2026-11-26: speech to text and measured model limits
 
 What changed (on main, for release 0.5.4; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`), the `weirdnet-model` part of the video design ([Ymir](https://github.com/WeirdBrains/ymir/blob/feature/video-upload/docs/design/video.md), [Bragi](https://github.com/WeirdBrains/bragi/blob/feature/video-upload/docs/design/video.md)):
