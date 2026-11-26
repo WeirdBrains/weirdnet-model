@@ -2,6 +2,21 @@
 
 Running log for [weirdnet-model](https://github.com/WeirdBrains/weirdnet-model), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-26: speech to text and measured model limits
+
+What changed (on main, for release 0.5.4; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`), the `weirdnet-model` part of the video design ([Ymir](https://github.com/WeirdBrains/ymir/blob/feature/video-upload/docs/design/video.md), [Bragi](https://github.com/WeirdBrains/bragi/blob/feature/video-upload/docs/design/video.md)):
+
+- `hw::Purpose::Transcribe` (`transcribe` on the wire), with `Purpose::as_str`, `parse` and `Display`. The catalog gains Voxtral Mini 3B (`hw::VOXTRAL_MINI_3B`, `ggml-org/Voxtral-Mini-3B-2507-GGUF`, Q4_K_M) with its pinned audio projector (`CatalogEntry::projector`), which `footprint` now counts; `hw::transcriber`, `hw::by_purpose`, `CatalogEntry::transcribes`. `hw::plan` never picks it.
+- `limits`: `ModelLimits` (context in use, images, audio per minute and per 30-second piece, video, request bytes; every field absent when unknown), `or`, `tightest`, `image_cost`, `audio_cost`; `from_projector` (Gemma 3, Qwen-VL, Voxtral, Ultravox and Qwen2 audio projectors, as llama.cpp's `mtmd` computes them); `measure` (model and projector headers at load, with the context the node runs at, never the trained one); `LimitsRecord` (`weirdnet-limits/1`, `LimitSource`, unknown fields kept). With `agent`: `to_media`, `from_media` and `From` both ways with `weirdnet_agent::MediaLimits` (the agent requirement is now 0.5.7).
+- `ModelStore::record_limits`, `limits`, `clear_limits`, `limits_path`: the record sits next to a GGUF's first file (`<file>.limits.json`) or inside a directory model (`.limits.json`), is dropped when the model's size changes, and goes with `remove_local`. `StoredModel::limits` is filled by `list` and `dir_models`.
+- `gguf::ProjectorInfo` on `GgufHeader::projector`; `LlamaEngine::limits`.
+
+Checks run: `cargo fmt --check`; clippy `-D warnings` with default features, `agent`, `--no-default-features` and `llama,agent`; tests with default features and `--no-default-features` (99 passed), `agent` (106) and `llama,agent` (107 passed, 2 ignored); the 2 ignored real-model tests with a local Qwen2.5 0.5B GGUF; `cargo doc -D warnings` with `llama,agent`; `cargo semver-checks` against 0.5.3 with `agent` and with `llama,agent` (no semver update required). `from_projector` and `measure` were also run against the headers of the published Voxtral, Gemma 3, Gemma 4, Qwen2.5-VL, Qwen2.5-Omni and Ultravox projector files.
+
+Not tested: transcribing real audio with Voxtral (no model was downloaded or run); token counts against a running llama-server; Gemma 4's projectors (`gemma4v`, `gemma4a`) and other projector types are left absent rather than computed.
+
+What's left and next: release 0.5.4. Then [weirdnet-backends](https://github.com/WeirdBrains/weirdnet-backends) can call `limits::measure` when it loads a model (with its `--ctx-size` per slot and any `--image-max-tokens`) and record it; [weirdnet-agent](https://github.com/WeirdBrains/weirdnet-agent)'s catalog `Purpose` needs a `transcribe` variant for the transcription route.
+
 ## 2026-11-26: CI on macOS and Windows
 
 What changed: [CI](.github/workflows/ci.yml) gets a `platforms` job on `macos-latest` and `windows-latest`: clippy `-D warnings` and tests with default features, tests with `agent` only, and clippy and tests with `llama,agent` (llama.cpp built from source with the runner's compiler). Linux keeps the full `check` and `cpu-dispatch` jobs.

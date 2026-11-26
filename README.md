@@ -25,7 +25,9 @@ cancel. App-agnostic; the model is optional at build time.
 - `agent` feature: `agent::LocalModel` implements `weirdnet_agent::ModelBackend`, so the agent
   loop can run on a local model with streamed text and parsed tool calls (`weirdnet-agent` 0.5;
   text only: messages with image or audio parts are refused).
-- `hw`: hardware detection and model sizing (see below).
+- `hw`: hardware detection and model sizing, with a speech-to-text model (see below).
+- `limits`: per-model media and request limits, read when a model loads and kept next to its
+  files (see below).
 
 ```toml
 weirdnet-model = { version = "0.5", features = ["llama", "agent"] }
@@ -49,6 +51,46 @@ through the consent gate.
 ```rust
 let hw = weirdnet_model::hw::detect();
 let plan = weirdnet_model::hw::plan(&hw, weirdnet_model::hw::budget(&hw, None, None));
+```
+
+## Speech to text
+
+Each catalog entry has a `Purpose`, its role on a node: `chat`, `embedding` or `transcribe`
+(`Purpose::as_str` and `Purpose::parse` give the wire names). The `transcribe` entry is
+[Voxtral Mini 3B](https://huggingface.co/ggml-org/Voxtral-Mini-3B-2507-GGUF)
+(`hw::VOXTRAL_MINI_3B`, Q4_K_M, Apache-2.0), which llama.cpp runs with its audio encoder:
+`CatalogEntry::projector()` is that pinned `mmproj` file, downloaded through the same consent
+gate and counted in `footprint`. Audio goes in as an `input_audio` part and the transcript comes
+back as text, so a soundtrack can become text for models without audio.
+
+`hw::plan` never proposes it, since transcription is optional; `hw::transcriber(&budget)` returns
+it when it fits, and `hw::by_purpose(Purpose::Transcribe)` lists the entries.
+
+## Model limits
+
+A client fitting images, audio or a video's frames to a model needs that model's limits, and
+there are no defaults: what isn't known stays absent. `ModelLimits` holds the context the model
+runs with on the node, images per request, what an image costs (a fixed number, or one token per
+`image_patch` pixels square up to `image_tokens`), the longest image edge, audio length and cost
+(per minute, and per piece for encoders that work on 30-second pieces), video length and bytes,
+and the largest request. `or` puts an operator's settings over measured ones, `tightest` merges
+copies, and `image_cost` and `audio_cost` price one input. With the `agent` feature it converts
+to and from `weirdnet_agent::MediaLimits` for catalog entries.
+
+When a node loads a model, `limits::measure(model, projector, context)` reads the GGUF and its
+projector: what the projector's header says images and audio cost (for Gemma 3, Qwen-VL,
+Voxtral, Ultravox and Qwen2 audio projectors, as llama.cpp computes it) and the context passed in,
+never the trained context. `ModelStore::record_limits` keeps the result next to the model's
+files and `StoredModel::limits` reads it back, until the model's files change.
+
+```rust
+use weirdnet_model::{ModelStore, limits};
+
+let store = ModelStore::from_env();
+let model = &store.list()[0];
+let first = store.dir().join(&model.files[0]);
+let record = limits::measure(&first, Some(&store.dir().join("mmproj-model.gguf")), Some(8192))?;
+store.record_limits(model, &record.with_engine("llama.cpp"))?;
 ```
 
 ## Hub search, fit and downloads

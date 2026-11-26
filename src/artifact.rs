@@ -352,6 +352,9 @@ fn safetensors_of(f: &Found) -> Result<SafetensorsHeader> {
 }
 
 /// The header read so far from the start of a file being received ([`early_header`]).
+// A GGUF header (with a projector's figures) is larger than a safetensors one; boxing it would
+// change the public variant, and one header per upload is cheap either way.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum EarlyHeader {

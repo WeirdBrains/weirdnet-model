@@ -3,7 +3,7 @@ name = "weirdnet-model"
 version = "0.5.3"
 edition = "2024"
 rust-version = "1.99"
-description = "Weirdnet local models: Hugging Face GGUF download with resume and checksum, a Gemma 4 catalog, hardware detection and model sizing, streaming llama.cpp inference on a worker thread with cancel, and an optional weirdnet-agent ModelBackend."
+description = "Weirdnet local models: Hugging Face GGUF download with resume and checksum, a Gemma 4 catalog with a speech-to-text model, per-model media limits, hardware detection and model sizing, streaming llama.cpp inference on a worker thread with cancel, and an optional weirdnet-agent ModelBackend."
 authors = ["Weird Brains LLC"]
 license = "BSD-3-Clause"
 repository = "https://github.com/WeirdBrains/weirdnet-model"
@@ -41,7 +41,7 @@ ureq = "3"
 
 async-trait = { version = "0.1", optional = true }
 llama-cpp-2 = { version = "0.1.161", default-features = false, features = ["sampler"], optional = true }
-weirdnet-agent = { version = "0.5", optional = true }
+weirdnet-agent = { version = "0.5.7", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

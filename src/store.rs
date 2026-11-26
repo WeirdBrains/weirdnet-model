@@ -14,6 +14,7 @@ use crate::artifact::{Artifact, ArtifactFormat, ArtifactKind, PROVENANCE_FILE, P
 use crate::catalog::ModelSpec;
 use crate::download::Progress;
 use crate::hf::{AdapterFormat, Hub, adapter_hint, split_part};
+use crate::limits::{LIMITS_FILE, LIMITS_SUFFIX, LimitsRecord};
 use crate::token::HfToken;
 
 /// The store's subdirectory for adapters: one directory per adapter id.
@@ -60,6 +61,10 @@ pub struct StoredModel {
     /// Where it came from, for models placed by [`ModelStore::import`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Provenance>,
+    /// The limits a node recorded when it loaded the model ([`ModelStore::record_limits`]), when
+    /// there is a current record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<LimitsRecord>,
 }
 
 /// [`StoredModel::layout`].
@@ -373,14 +378,17 @@ impl ModelStore {
                 if let Some(p) = &provenance {
                     id = p.id.clone();
                 }
-                StoredModel {
+                let mut m = StoredModel {
                     id,
                     size: parts.iter().map(|p| p.2).sum(),
                     files: parts.into_iter().map(|p| p.1).collect(),
                     complete,
                     layout: ModelLayout::Gguf,
                     provenance,
-                }
+                    limits: None,
+                };
+                m.limits = self.limits(&m);
+                m
             })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.files.cmp(&b.files)));
@@ -403,6 +411,7 @@ impl ModelStore {
         for rel in &model.files {
             crate::hf::check_file(rel)?;
         }
+        self.clear_limits(model);
         for rel in &model.files {
             let path = self.dir.join(rel);
             let _ = std::fs::remove_file(self.dir.join(format!("{rel}.part")));
@@ -526,6 +535,54 @@ impl ModelStore {
 }
 
 impl ModelStore {
+    /// Where `model`'s limits record goes: `<first file>.limits.json` next to a GGUF model's
+    /// first file, `.limits.json` inside a safetensors or MLX directory.
+    pub fn limits_path(&self, model: &StoredModel) -> crate::Result<PathBuf> {
+        match model.layout {
+            ModelLayout::Gguf => {
+                let first = model.files.first().ok_or_else(|| crate::Error::Model(format!("{} has no files", model.id)))?;
+                crate::hf::check_file(first)?;
+                Ok(self.dir.join(format!("{first}{LIMITS_SUFFIX}")))
+            }
+            layout => Ok(self.model_dir(layout, &model.id)?.join(LIMITS_FILE)),
+        }
+    }
+
+    /// Keeps `record` next to `model`'s files, replacing any earlier one atomically, with the
+    /// model's current size so a later change to its files makes the record stale. A node calls
+    /// this when it loads the model (see [`limits::measure`](crate::limits::measure)).
+    pub fn record_limits(&self, model: &StoredModel, record: &LimitsRecord) -> crate::Result<()> {
+        let path = self.limits_path(model)?;
+        let dir = path.parent().filter(|d| d.is_dir()).ok_or_else(|| crate::Error::Model(format!("{} is not in the store", model.id)))?;
+        let mut record = record.clone();
+        record.model_bytes = Some(model.size);
+        let json = serde_json::to_vec_pretty(&record).map_err(|e| crate::Error::Model(e.to_string()))?;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let tmp = dir.join(format!(".{}.tmp", name.trim_start_matches('.')));
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// `model`'s limits record, if there is a current one: `None` when there is none, it is not
+    /// a regular file or doesn't parse, its format is another, or the model's files changed size
+    /// since it was recorded.
+    pub fn limits(&self, model: &StoredModel) -> Option<LimitsRecord> {
+        let path = self.limits_path(model).ok()?;
+        if !std::fs::symlink_metadata(&path).ok()?.is_file() {
+            return None;
+        }
+        let r: LimitsRecord = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+        (r.format == crate::limits::LIMITS_FORMAT && r.model_bytes.is_none_or(|b| b == model.size)).then_some(r)
+    }
+
+    /// Deletes `model`'s limits record. Returns whether there was one.
+    pub fn clear_limits(&self, model: &StoredModel) -> bool {
+        self.limits_path(model).is_ok_and(|p| std::fs::remove_file(p).is_ok())
+    }
+}
+
+impl ModelStore {
     /// The safetensors (`safetensors/<id>/`) and MLX (`mlx/<id>/`) model directories, sorted by
     /// id. [`ModelStore::list`] has the GGUF models. A directory is complete when it has its
     /// `config.json`.
@@ -541,14 +598,17 @@ impl ModelStore {
                 if files.is_empty() {
                     continue;
                 }
-                out.push(StoredModel {
+                let mut m = StoredModel {
                     id: name,
                     size: files.iter().map(|f| f.1).sum(),
                     complete: e.path().join("config.json").is_file(),
                     files: files.into_iter().map(|f| f.0).collect(),
                     layout,
                     provenance: Provenance::read(&e.path()).filter(|p| p.kind == ProvenanceKind::Model),
-                });
+                    limits: None,
+                };
+                m.limits = self.limits(&m);
+                out.push(m);
             }
         }
         out.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.files.cmp(&b.files)));
@@ -846,6 +906,7 @@ impl ModelStore {
                     _ => ModelLayout::Gguf,
                 },
                 provenance: Some(record),
+                limits: None,
             }),
         }
     }
@@ -931,6 +992,76 @@ mod tests {
         let mut evil = list[0].clone();
         evil.files = vec!["../x.gguf".into()];
         assert!(store.remove_local(&evil).is_err());
+    }
+
+    #[test]
+    fn limits_records_sit_next_to_gguf_models_and_go_with_them() {
+        use crate::limits::{LimitSource, ModelLimits};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(tmp.path());
+        let w = |rel: &str, n: usize| {
+            let p = tmp.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![0u8; n]).unwrap();
+        };
+        w("a-Q4_0.gguf", 3);
+        w("Q8_0/b-Q8_0-00001-of-00002.gguf", 5);
+        w("Q8_0/b-Q8_0-00002-of-00002.gguf", 6);
+        let list = store.list();
+        assert!(list.iter().all(|m| m.limits.is_none()), "no record yet");
+        let record = LimitsRecord::new(ModelLimits::new().with_context_tokens(8192).with_audio_chunks(30, 187), LimitSource::Measured)
+            .with_engine("llama.cpp");
+        store.record_limits(&list[0], &record).unwrap();
+        store.record_limits(&list[1], &record.clone()).unwrap();
+        assert!(tmp.path().join("a-Q4_0.gguf.limits.json").is_file());
+        assert!(tmp.path().join("Q8_0/b-Q8_0-00001-of-00002.gguf.limits.json").is_file());
+        let again = store.list();
+        assert_eq!(again.len(), 2, "records are not models");
+        let a = again[0].limits.clone().unwrap();
+        assert_eq!((a.limits, a.model_bytes, a.engine.as_deref()), (record.limits, Some(3), Some("llama.cpp")));
+        assert_eq!(store.limits(&again[1]).unwrap().model_bytes, Some(11));
+        // A record whose model changed size is stale.
+        w("a-Q4_0.gguf", 4);
+        assert!(store.list()[0].limits.is_none());
+        // Another format, junk or a directory in its place reads as none.
+        std::fs::write(tmp.path().join("a-Q4_0.gguf.limits.json"), br#"{"format":"other/1"}"#).unwrap();
+        assert!(store.limits(&store.list()[0]).is_none());
+        std::fs::write(tmp.path().join("a-Q4_0.gguf.limits.json"), b"{").unwrap();
+        assert!(store.limits(&store.list()[0]).is_none());
+        // Removing a model removes its record, and the emptied directory still goes.
+        assert_eq!(store.remove_local(&again[1]).unwrap(), 11);
+        assert!(!tmp.path().join("Q8_0").exists());
+        assert!(store.clear_limits(&store.list()[0]));
+        assert!(!store.clear_limits(&store.list()[0]));
+        // Paths that leave the store are refused.
+        let mut evil = again[0].clone();
+        evil.files = vec!["../x.gguf".into()];
+        assert!(store.limits_path(&evil).is_err() && store.record_limits(&evil, &record).is_err());
+        let mut none = again[0].clone();
+        none.files.clear();
+        assert!(store.limits_path(&none).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_limits_record_is_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(tmp.path());
+        std::fs::write(tmp.path().join("a.gguf"), b"GGUF").unwrap();
+        let elsewhere = tmp.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, serde_json::to_vec(&LimitsRecord::default()).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, tmp.path().join("a.gguf.limits.json")).unwrap();
+        assert!(store.list()[0].limits.is_none());
+    }
+
+    #[test]
+    fn stored_models_from_before_limits_still_read() {
+        let old = serde_json::json!({"id": "a", "files": ["a.gguf"], "size": 3, "complete": true});
+        let m: StoredModel = serde_json::from_value(old).unwrap();
+        assert!(m.limits.is_none() && m.provenance.is_none());
+        assert_eq!(m.layout, ModelLayout::Gguf);
+        let j = serde_json::to_value(&m).unwrap();
+        assert!(j.get("limits").is_none(), "absent limits stay off the wire");
     }
 
     #[test]
@@ -1140,6 +1271,27 @@ mod tests {
             assert_eq!(store.remove_local(&dirs[0]).unwrap(), b.size());
             assert!(!store.dir().join("mlx/x-mlx").exists());
             assert_eq!(store.bytes_by_origin(ORIGIN_UPLOAD), a.size());
+        }
+
+        #[test]
+        fn directory_models_keep_their_limits_record_inside_and_hidden() {
+            use crate::limits::{LimitSource, ModelLimits};
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ModelStore::new(tmp.path());
+            let dir = tmp.path().join("safetensors/x-st");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("config.json"), b"{}").unwrap();
+            std::fs::write(dir.join("model.safetensors"), vec![0u8; 8]).unwrap();
+            let m = store.dir_models().remove(0);
+            let r = LimitsRecord::new(ModelLimits::new().with_image_tokens(256), LimitSource::Operator);
+            store.record_limits(&m, &r).unwrap();
+            assert!(dir.join(".limits.json").is_file());
+            let again = store.dir_models().remove(0);
+            assert_eq!(again.files, m.files, "the record is not one of the model's files");
+            assert_eq!(again.size, m.size);
+            assert_eq!(again.limits.as_ref().map(|l| (l.limits, l.source)), Some((r.limits, LimitSource::Operator)));
+            store.remove_local(&again).unwrap();
+            assert!(!dir.exists(), "the record doesn't keep the directory alive");
         }
 
         #[test]

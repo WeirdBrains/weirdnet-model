@@ -4,16 +4,18 @@
 //!   threads and system memory. Never fails; missing tools mean fewer devices.
 //! - [`budget()`]: the memory models may use (85% of VRAM, or of unified memory after an OS
 //!   reserve), with overrides.
-//! - [`catalog()`] and [`find()`]: a small tiered catalog of chat and embedding models with their
-//!   memory footprints; entries are [`ModelSpec`](crate::ModelSpec)s where this crate pins the
-//!   file, so they download through the consent gate.
-//! - [`plan()`]: the main chat model, a stand-in and an embedding model that fit the budget.
+//! - [`catalog()`] and [`find()`]: a small tiered catalog of chat, embedding and speech-to-text
+//!   ([`Purpose::Transcribe`]) models with their memory footprints; entries are
+//!   [`ModelSpec`](crate::ModelSpec)s where this crate pins the file (and the projector a model
+//!   needs, [`CatalogEntry::projector`]), so they download through the consent gate.
+//! - [`plan()`]: the main chat model, a stand-in and an embedding model that fit the budget;
+//!   [`transcriber()`]: the speech-to-text model that fits, for apps that want one.
 
 mod detect;
 mod sizing;
 
 pub use detect::{Accel, Gpu, Hardware, detect, parse_meminfo_total, parse_nvidia_smi};
-pub use sizing::{Budget, CatalogEntry, Plan, Purpose, budget, catalog, find, plan};
+pub use sizing::{Budget, CatalogEntry, Plan, Purpose, VOXTRAL_MINI_3B, budget, by_purpose, catalog, find, plan, transcriber};
 
 /// 1 GiB.
 pub const GIB: u64 = 1 << 30;

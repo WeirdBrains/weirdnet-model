@@ -1,6 +1,7 @@
 //! The parts of a GGUF header that size a model's KV cache, read from the start of the file
 //! (over HTTP with a `Range` request, see [`Hub::gguf_info`](crate::hf::Hub::gguf_info)), and
-//! whether a file is a model or a LoRA adapter ([`read_header`]).
+//! whether a file is a model, a LoRA adapter or a multimodal projector ([`read_header`]), with
+//! what a projector's header says about the images and audio it takes ([`ProjectorInfo`]).
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -89,6 +90,65 @@ pub struct GgufHeader {
     /// The KV shape of a model; `None` for adapters (they have no blocks of their own) and
     /// headers that lack the figures.
     pub info: Option<GgufInfo>,
+    /// What a projector takes (`clip.*` keys); `None` for models and adapters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projector: Option<ProjectorInfo>,
+}
+
+/// What a multimodal projector's header (llama.cpp `mtmd`, the `clip.*` keys) says about the
+/// images and audio it takes. Every figure is as written in the header, `None` when the key is
+/// missing; [`limits::from_projector`](crate::limits::from_projector) turns them into token costs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ProjectorInfo {
+    /// `clip.has_vision_encoder`: the model reads images.
+    pub vision: bool,
+    /// `clip.has_audio_encoder`: the model reads audio.
+    pub audio: bool,
+    /// The image projector type (`clip.vision.projector_type`, else `clip.projector_type`), such
+    /// as `gemma3` or `qwen2.5vl_merger`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_projector: Option<String>,
+    /// The audio projector type (`clip.audio.projector_type`, else `clip.projector_type`), such
+    /// as `voxtral` or `ultravox`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_projector: Option<String>,
+    /// `clip.vision.image_size`: the edge in pixels the encoder works at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<u32>,
+    /// `clip.vision.patch_size`: the edge in pixels of one encoder patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_size: Option<u32>,
+    /// `clip.vision.spatial_merge_size`: patches merged per side (Qwen-VL and others).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spatial_merge: Option<u32>,
+    /// `clip.vision.projector.scale_factor`: patches pooled per side (Gemma 3, Idefics 3 and
+    /// others).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_factor: Option<u32>,
+    /// `clip.vision.image_max_pixels`: the most pixels one image is resized to (dynamic-size
+    /// encoders).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_max_pixels: Option<u64>,
+    /// `clip.audio.projector.stack_factor`: audio frames stacked into one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_stack_factor: Option<u32>,
+    /// `clip.audio.num_mel_bins`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_mel_bins: Option<u32>,
+}
+
+impl ProjectorInfo {
+    /// The projector type that applies to images: the vision type, else the shared one when the
+    /// projector has a vision encoder.
+    pub fn image_type(&self) -> Option<&str> {
+        self.vision.then_some(self.vision_projector.as_deref()).flatten()
+    }
+
+    /// The projector type that applies to audio, when the projector has an audio encoder.
+    pub fn audio_type(&self) -> Option<&str> {
+        self.audio.then_some(self.audio_projector.as_deref()).flatten()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -300,7 +360,37 @@ pub fn read_header(r: impl Read) -> Result<GgufHeader> {
     let info = if matches!(kind, GgufKind::Model) { info_from(&kv).ok() } else { None };
     let base_model = text("general.base_model.0.repo_url").and_then(|u| hub_id(&u));
     let repo = text("general.source.repo_url").or_else(|| text("general.repo_url")).and_then(|u| hub_id(&u));
-    Ok(GgufHeader { kind, architecture, base_model, repo, info })
+    let projector = kind.is_projector().then(|| projector_from(&kv));
+    Ok(GgufHeader { kind, architecture, base_model, repo, info, projector })
+}
+
+/// The `clip.*` keys of a projector header.
+fn projector_from(kv: &Kv) -> ProjectorInfo {
+    let text = |k: &str| match kv.get(k) {
+        Some(Val::Str(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    };
+    let int = |k: &str| match kv.get(k) {
+        Some(Val::Int(v)) => Some(*v),
+        _ => None,
+    };
+    let small = |k: &str| int(k).and_then(|v| u32::try_from(v).ok());
+    let shared = text("clip.projector_type");
+    let vision = int("clip.has_vision_encoder").is_some_and(|v| v != 0);
+    let audio = int("clip.has_audio_encoder").is_some_and(|v| v != 0);
+    ProjectorInfo {
+        vision,
+        audio,
+        vision_projector: text("clip.vision.projector_type").or_else(|| shared.clone().filter(|_| vision)),
+        audio_projector: text("clip.audio.projector_type").or_else(|| shared.filter(|_| audio)),
+        image_size: small("clip.vision.image_size"),
+        patch_size: small("clip.vision.patch_size"),
+        spatial_merge: small("clip.vision.spatial_merge_size"),
+        scale_factor: small("clip.vision.projector.scale_factor"),
+        image_max_pixels: int("clip.vision.image_max_pixels"),
+        audio_stack_factor: small("clip.audio.projector.stack_factor"),
+        audio_mel_bins: small("clip.audio.num_mel_bins"),
+    }
 }
 
 /// GGUF header bytes for tests.
@@ -369,6 +459,59 @@ pub(crate) fn lora_header(arch: &str) -> Vec<u8> {
         ("adapter.type", json!("lora")),
         ("adapter.lora.alpha", json!(32.5)),
     ])
+}
+
+/// Projector headers with the `clip.*` keys of real llama.cpp `mmproj` files, for tests:
+/// `voxtral` (Voxtral Mini 3B), `ultravox`, `gemma3` (Gemma 3 4B), `qwen2.5vl` (Qwen2.5-VL 3B),
+/// `qwen2.5o` (Qwen2.5-Omni 3B) and `qwen3vl` (Qwen3-VL 2B).
+#[cfg(test)]
+pub(crate) fn projector_header(which: &str) -> Vec<u8> {
+    use serde_json::json;
+    let mut kv = vec![("general.architecture", json!("clip")), ("general.type", json!("mmproj"))];
+    match which {
+        "voxtral" => kv.extend([
+            ("clip.has_audio_encoder", json!(true)),
+            ("clip.projector_type", json!("voxtral")),
+            ("clip.audio.num_mel_bins", json!(128)),
+            ("clip.audio.projector.stack_factor", json!(4)),
+        ]),
+        "ultravox" => kv.extend([
+            ("clip.has_audio_encoder", json!(true)),
+            ("clip.projector_type", json!("ultravox")),
+            ("clip.audio.num_mel_bins", json!(128)),
+            ("clip.audio.projector.stack_factor", json!(8)),
+        ]),
+        "gemma3" => kv.extend([
+            ("clip.projector_type", json!("gemma3")),
+            ("clip.has_text_encoder", json!(false)),
+            ("clip.has_vision_encoder", json!(true)),
+            ("clip.vision.image_size", json!(896)),
+            ("clip.vision.patch_size", json!(14)),
+        ]),
+        "qwen2.5vl" => kv.extend([
+            ("clip.has_vision_encoder", json!(true)),
+            ("clip.vision.image_size", json!(560)),
+            ("clip.vision.patch_size", json!(14)),
+            ("clip.projector_type", json!("qwen2.5vl_merger")),
+        ]),
+        "qwen2.5o" => kv.extend([
+            ("clip.has_vision_encoder", json!(true)),
+            ("clip.vision.image_size", json!(560)),
+            ("clip.vision.patch_size", json!(14)),
+            ("clip.has_audio_encoder", json!(true)),
+            ("clip.projector_type", json!("qwen2.5o")),
+            ("clip.audio.num_mel_bins", json!(128)),
+        ]),
+        "qwen3vl" => kv.extend([
+            ("clip.has_vision_encoder", json!(true)),
+            ("clip.vision.image_size", json!(768)),
+            ("clip.vision.patch_size", json!(16)),
+            ("clip.projector_type", json!("qwen3vl_merger")),
+            ("clip.vision.spatial_merge_size", json!(2)),
+        ]),
+        other => panic!("no test projector {other}"),
+    }
+    header(&kv)
 }
 
 #[cfg(test)]
@@ -462,5 +605,37 @@ mod tests {
         assert!(h.kind.is_projector() && !h.kind.is_adapter() && h.info.is_none());
         let untyped = header(&[("general.architecture", json!("clip"))]);
         assert_eq!(read_header(&untyped[..]).unwrap().kind, GgufKind::Projector);
+    }
+
+    #[test]
+    fn projector_headers_say_what_they_take() {
+        let v = read_header(&projector_header("voxtral")[..]).unwrap().projector.unwrap();
+        assert!(v.audio && !v.vision);
+        assert_eq!((v.audio_type(), v.image_type(), v.audio_stack_factor, v.audio_mel_bins), (Some("voxtral"), None, Some(4), Some(128)));
+        let g = read_header(&projector_header("gemma3")[..]).unwrap().projector.unwrap();
+        assert!(g.vision && !g.audio);
+        assert_eq!((g.image_type(), g.audio_type(), g.image_size, g.patch_size, g.scale_factor), (Some("gemma3"), None, Some(896), Some(14), None));
+        let o = read_header(&projector_header("qwen2.5o")[..]).unwrap().projector.unwrap();
+        assert_eq!((o.image_type(), o.audio_type()), (Some("qwen2.5o"), Some("qwen2.5o")), "one shared type for both encoders");
+        let q = read_header(&projector_header("qwen3vl")[..]).unwrap().projector.unwrap();
+        assert_eq!(q.spatial_merge, Some(2));
+        // Split types, as newer converters write them (Gemma 4).
+        let split = header(&[
+            ("general.architecture", json!("clip")),
+            ("clip.has_vision_encoder", json!(true)),
+            ("clip.has_audio_encoder", json!(true)),
+            ("clip.vision.projector_type", json!("gemma4v")),
+            ("clip.audio.projector_type", json!("gemma4a")),
+        ]);
+        let s = read_header(&split[..]).unwrap().projector.unwrap();
+        assert_eq!((s.image_type(), s.audio_type()), (Some("gemma4v"), Some("gemma4a")));
+        // Models and adapters have none; a header from before the field still deserializes.
+        assert!(read_header(&lora_header("llama")[..]).unwrap().projector.is_none());
+        let old: GgufHeader =
+            serde_json::from_value(json!({"kind": "projector", "architecture": "clip", "base_model": null, "repo": null, "info": null})).unwrap();
+        assert!(old.projector.is_none());
+        let back: GgufHeader =
+            serde_json::from_str(&serde_json::to_string(&read_header(&projector_header("ultravox")[..]).unwrap()).unwrap()).unwrap();
+        assert_eq!(back.projector.unwrap().audio_stack_factor, Some(8));
     }
 }

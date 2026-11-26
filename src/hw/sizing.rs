@@ -5,14 +5,43 @@ use serde::{Deserialize, Serialize};
 
 use super::{Accel, GIB, Hardware};
 
-/// What a model is for on a node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// What a model is for on a node (its role): `chat`, `embedding` or `transcribe` on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Purpose {
     Chat,
     Embedding,
+    /// Speech to text: audio in (an `input_audio` part), its transcript out, so a soundtrack can
+    /// become text for models that don't take audio. Never picked as a chat model.
+    Transcribe,
 }
+
+impl Purpose {
+    /// The name on the wire and in settings: `chat`, `embedding` or `transcribe`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Purpose::Chat => "chat",
+            Purpose::Embedding => "embedding",
+            Purpose::Transcribe => "transcribe",
+        }
+    }
+
+    /// The purpose named `name` (as [`as_str`](Self::as_str) writes it), if any.
+    pub fn parse(name: &str) -> Option<Purpose> {
+        [Purpose::Chat, Purpose::Embedding, Purpose::Transcribe].into_iter().find(|p| p.as_str() == name)
+    }
+}
+
+impl std::fmt::Display for Purpose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The speech-to-text entry ([`Purpose::Transcribe`]): Voxtral Mini 3B, which llama.cpp runs
+/// with its projector ([`CatalogEntry::projector`]).
+pub const VOXTRAL_MINI_3B: &str = "voxtral-mini-3b";
 
 /// A catalog model with what it needs in memory.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -34,11 +63,34 @@ impl CatalogEntry {
         &self.spec.id
     }
 
-    /// Weights plus KV for `slots` concurrent requests at the entry's context, plus 10% for compute
-    /// buffers.
+    /// Weights (and the projector's, for entries that need one) plus KV for `slots` concurrent
+    /// requests at the entry's context, plus 10% for compute buffers.
     pub fn footprint(&self, slots: u32) -> u64 {
         let kv = self.kv_bytes_per_token * self.context as u64 * slots as u64;
-        (self.spec.size + kv) + (self.spec.size + kv) / 10
+        let weights = self.spec.size + self.projector().map_or(0, |p| p.size);
+        (weights + kv) + (weights + kv) / 10
+    }
+
+    /// The multimodal projector (llama.cpp `--mmproj`) the entry needs to take its input, pinned
+    /// like the model file: the audio encoder for [`VOXTRAL_MINI_3B`]. `None` for text models.
+    /// Download it with the same consent gate as the model.
+    pub fn projector(&self) -> Option<ModelSpec> {
+        match self.spec.id.as_str() {
+            VOXTRAL_MINI_3B => Some(spec(
+                "voxtral-mini-3b-mmproj",
+                "Voxtral Mini 3B audio encoder (Q8_0)",
+                "ggml-org/Voxtral-Mini-3B-2507-GGUF",
+                "mmproj-Voxtral-Mini-3B-2507-Q8_0.gguf",
+                715_714_080,
+                "4f24c4ef3ce929d02ed9d1cfb050ae9a7365f057c0ddec0d489580982ebe0d02",
+            )),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a speech-to-text model ([`Purpose::Transcribe`]).
+    pub fn transcribes(&self) -> bool {
+        self.purpose == Purpose::Transcribe
     }
 }
 
@@ -51,8 +103,9 @@ fn chat(spec: ModelSpec, quant: &str, params_b: f32, active_params_b: f32, kv_by
     CatalogEntry { spec, purpose: Purpose::Chat, quant: quant.into(), params_b, active_params_b, kv_bytes_per_token, context }
 }
 
-/// The tiered catalog, smallest first. Sizes and SHA-256 from the Hugging Face API (2026-11-19);
-/// the Gemma 4 files are `weirdnet-model`'s own pinned entries.
+/// The tiered catalog: chat models smallest first, then the embedding model, then the
+/// speech-to-text model. Sizes and SHA-256 from the Hugging Face API (2026-11-19; Voxtral
+/// 2026-11-26); the Gemma 4 files are `weirdnet-model`'s own pinned entries.
 pub fn catalog() -> Vec<CatalogEntry> {
     let gemma = |id: &str| crate::catalog::find(id).expect("weirdnet-model ships Gemma 4");
     vec![
@@ -164,7 +217,38 @@ pub fn catalog() -> Vec<CatalogEntry> {
             kv_bytes_per_token: 114_688,
             context: 2048,
         },
+        // Mistral's Voxtral Mini 3B (Apache-2.0): a Whisper-style audio encoder in front of a 3B
+        // decoder, transcription in eight languages; 30 seconds of audio cost 187 tokens in
+        // llama.cpp, so 16K of context holds about 20 minutes with its transcript.
+        CatalogEntry {
+            spec: spec(
+                VOXTRAL_MINI_3B,
+                "Voxtral Mini 3B speech to text (Q4_K_M)",
+                "ggml-org/Voxtral-Mini-3B-2507-GGUF",
+                "Voxtral-Mini-3B-2507-Q4_K_M.gguf",
+                2_473_001_920,
+                "4705be8ec22ca23d12632f4b4a3691faa95917d90a06d3cf3c3ec0e91958f1a8",
+            ),
+            purpose: Purpose::Transcribe,
+            quant: "Q4_K_M".into(),
+            params_b: 4.7,
+            active_params_b: 4.7,
+            kv_bytes_per_token: 122_880,
+            context: 16_384,
+        },
     ]
+}
+
+/// The catalog entries for `purpose`, in catalog order.
+pub fn by_purpose(purpose: Purpose) -> Vec<CatalogEntry> {
+    catalog().into_iter().filter(|e| e.purpose == purpose).collect()
+}
+
+/// The speech-to-text model ([`Purpose::Transcribe`]) that fits `budget` with one request at
+/// a time, projector included, if any. [`plan`] never proposes one: transcription is optional,
+/// so an app adds it when it wants soundtracks turned into text.
+pub fn transcriber(budget: &Budget) -> Option<CatalogEntry> {
+    by_purpose(Purpose::Transcribe).into_iter().filter(|e| e.footprint(1) <= budget.usable_bytes).max_by(|a, b| a.params_b.total_cmp(&b.params_b))
 }
 
 /// The catalog entry with this id.
@@ -282,5 +366,59 @@ mod tests {
         let hw = box_with(Vec::new(), 64);
         assert_eq!(budget(&hw, Some(10 * GIB), None).usable_bytes, 10 * GIB);
         assert_eq!(budget(&hw, None, Some(14 * GIB)).reserve_bytes, 14 * GIB);
+    }
+
+    #[test]
+    fn transcribe_is_a_purpose_of_its_own() {
+        assert_eq!(serde_json::to_string(&Purpose::Transcribe).unwrap(), "\"transcribe\"");
+        for p in [Purpose::Chat, Purpose::Embedding, Purpose::Transcribe] {
+            assert_eq!(serde_json::from_str::<Purpose>(&format!("\"{p}\"")).unwrap(), p);
+            assert_eq!(Purpose::parse(p.as_str()), Some(p));
+        }
+        assert_eq!(Purpose::parse("speech"), None);
+        // Stored entries from before the variant still read.
+        assert_eq!(serde_json::from_str::<Purpose>("\"chat\"").unwrap(), Purpose::Chat);
+    }
+
+    #[test]
+    fn the_catalog_has_a_pinned_speech_to_text_model() {
+        let stt = by_purpose(Purpose::Transcribe);
+        assert_eq!(stt.len(), 1);
+        let v = &stt[0];
+        assert_eq!((v.id(), v.quant.as_str(), v.context), (VOXTRAL_MINI_3B, "Q4_K_M", 16_384));
+        assert!(v.transcribes());
+        assert_eq!(find(VOXTRAL_MINI_3B).as_ref(), Some(v));
+        assert_eq!(v.spec.repo, "ggml-org/Voxtral-Mini-3B-2507-GGUF");
+        assert_eq!(v.spec.sha256.as_deref().map(str::len), Some(64));
+        let p = v.projector().expect("Voxtral needs its audio encoder");
+        assert_eq!((p.repo.as_str(), p.file.as_str(), p.size), (v.spec.repo.as_str(), "mmproj-Voxtral-Mini-3B-2507-Q8_0.gguf", 715_714_080));
+        assert!(p.sha256.as_deref().is_some_and(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit())));
+        assert_ne!(p.file, v.spec.file);
+        // 30 layers x 8 KV heads x (128 + 128) x 2 bytes.
+        assert_eq!(v.kv_bytes_per_token, 30 * 8 * 256 * 2);
+        // The projector counts in the footprint; text models have none.
+        let without = (v.spec.size + v.kv_bytes_per_token * 16_384) * 11 / 10;
+        assert!(v.footprint(1) > without);
+        assert!(catalog().iter().filter(|e| !e.transcribes()).all(|e| e.projector().is_none()));
+        // Catalog ids stay unique.
+        let mut ids: Vec<_> = catalog().iter().map(|e| e.id().to_string()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), catalog().len());
+    }
+
+    #[test]
+    fn plans_never_pick_the_transcriber_and_it_fits_on_its_own() {
+        for (gpus, ram) in [(parse_nvidia_smi("NVIDIA GeForce RTX 3060, 12288, 8.6, 615.78.08", 62 * GIB), 62), (Vec::new(), 62), (Vec::new(), 8)] {
+            let hw = box_with(gpus, ram);
+            let p = plan(&hw, budget(&hw, None, None));
+            for e in [&p.main, &p.standin, &p.embedding].into_iter().flatten() {
+                assert!(!e.transcribes(), "{} in a plan", e.id());
+            }
+        }
+        let hw = box_with(Vec::new(), 62);
+        assert_eq!(transcriber(&budget(&hw, None, None)).map(|e| e.spec.id), Some(VOXTRAL_MINI_3B.into()));
+        assert_eq!(transcriber(&budget(&hw, Some(GIB), None)), None, "too small a budget");
+        assert!(by_purpose(Purpose::Embedding).iter().all(|e| e.purpose == Purpose::Embedding));
     }
 }

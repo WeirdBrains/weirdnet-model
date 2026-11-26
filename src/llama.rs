@@ -176,6 +176,12 @@ impl LlamaEngine {
         Ok(Self { model, opts })
     }
 
+    /// What this engine runs the model with, as loaded: the context in tokens
+    /// ([`LlamaOptions::context`]). It reads text only, so no image or audio figures.
+    pub fn limits(&self) -> crate::limits::ModelLimits {
+        crate::limits::ModelLimits::new().with_context_tokens(self.opts.context)
+    }
+
     /// A [`Worker`](crate::Worker) loader for `path`, for `Worker::spawn`.
     pub fn loader(path: std::path::PathBuf, opts: LlamaOptions) -> impl FnMut() -> Result<Box<dyn Engine>> + Send + 'static {
         move || Ok(Box::new(LlamaEngine::load(&path, opts)?) as Box<dyn Engine>)
@@ -298,6 +304,18 @@ mod tests {
             last = Some(c);
         }
         assert!(matches!(last, Some(crate::Chunk::Done(Stats { stop: StopCause::Cancelled, .. }))));
+    }
+
+    /// Needs a real GGUF, as above.
+    #[test]
+    #[ignore = "needs a real model file"]
+    fn a_real_model_reports_the_context_it_runs_with() {
+        let path = std::path::PathBuf::from(std::env::var("WEIRDNET_TEST_GGUF").expect("set WEIRDNET_TEST_GGUF"));
+        let engine = LlamaEngine::load(&path, LlamaOptions { context: 1024, ..Default::default() }).unwrap();
+        assert_eq!(engine.limits(), crate::limits::ModelLimits::new().with_context_tokens(1024));
+        let record = crate::limits::measure(&path, None, engine.limits().context_tokens).unwrap();
+        assert_eq!(record.limits.context_tokens, Some(1024));
+        assert!(record.trained_context.is_some_and(|t| t > 0), "the header's trained context is kept for reference");
     }
 
     #[test]

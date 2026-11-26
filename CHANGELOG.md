@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- `Purpose::Transcribe`, the `transcribe` role, with `Purpose::as_str`, `parse` and `Display`.
+- A speech-to-text catalog entry, Voxtral Mini 3B (`hw::VOXTRAL_MINI_3B`), with its pinned projector (`CatalogEntry::projector`); `hw::transcriber`, `hw::by_purpose` and `CatalogEntry::transcribes`.
+- `limits`: `ModelLimits` (context in use, images, audio, video and request limits; absent when unknown), `from_projector`, `measure` and `LimitsRecord`, with `agent`-feature conversions to and from `weirdnet_agent::MediaLimits`.
+- `ModelStore::record_limits`, `limits`, `clear_limits` and `limits_path`; `StoredModel::limits`.
+- `gguf::ProjectorInfo` on `GgufHeader::projector`: what a projector's header says it takes.
+- `LlamaEngine::limits`: the context the engine runs with.
+
+### Changed
+
+- `CatalogEntry::footprint` counts an entry's projector.
+- The `agent` feature needs `weirdnet-agent` 0.5.7.
+
 ## [0.5.3] - 2026-11-24
 
 ### Added
