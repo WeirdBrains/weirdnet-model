@@ -98,6 +98,9 @@ pub struct StoredProjector {
 }
 
 /// What [`ModelStore::import`] placed.
+// A stored model carries its limits record (and a speech model's profile); boxing it would
+// change the public variants.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]

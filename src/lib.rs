@@ -25,8 +25,11 @@
 //! - [`cpu`]: whether this CPU can run the compiled-in llama.cpp (checked before it loads).
 //! - [`hw`]: what accelerators and memory this machine has, the memory budget for models, a
 //!   tiered catalog with footprints (chat, embedding and a speech-to-text model with the
-//!   `transcribe` role, [`hw::Purpose::Transcribe`]), [`hw::plan`] to pick models that fit and
-//!   [`hw::transcriber`] for the speech-to-text one.
+//!   `transcribe` role, [`hw::Purpose::Transcribe`], and text-to-speech models with the `speak`
+//!   role, [`hw::Purpose::Speak`]), [`hw::plan`] to pick models that fit, [`hw::transcriber`]
+//!   for the speech-to-text one and [`hw::speaker`] for a text-to-speech one.
+//! - [`speech`]: what a speaking model does ([`SpeechProfile`]), from the catalog, from a
+//!   hand-placed GGUF's headers ([`speech::from_gguf`]) or kept with its limits.
 //! - `llama` (feature): the llama.cpp [`Engine`].
 //! - `agent` (feature): `weirdnet_agent::ModelBackend` over the worker.
 //!
@@ -43,6 +46,7 @@ pub mod hf;
 pub mod hw;
 pub mod limits;
 pub mod prompt;
+pub mod speech;
 pub mod store;
 #[cfg(test)]
 mod testing;
@@ -60,6 +64,7 @@ pub use download::{Consent, Progress, download, download_adapter, download_parts
 pub use hf::{AdapterFormat, Hub, RepoAdapter};
 pub use limits::{LimitSource, LimitsRecord, ModelLimits};
 pub use prompt::{ChatMessage, ChatRole};
+pub use speech::SpeechProfile;
 pub use store::{DiskSpace, Imported, ModelLayout, ModelStore, StoredAdapter, StoredModel, StoredProjector};
 pub use token::HfToken;
 pub use worker::{Chunk, Engine, GenerateRequest, Generation, Stats, Worker};

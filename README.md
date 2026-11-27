@@ -55,7 +55,7 @@ let plan = weirdnet_model::hw::plan(&hw, weirdnet_model::hw::budget(&hw, None, N
 
 ## Speech to text
 
-Each catalog entry has a `Purpose`, its role on a node: `chat`, `embedding` or `transcribe`
+Each catalog entry has a `Purpose`, its role on a node: `chat`, `embedding`, `transcribe` or `speak`
 (`Purpose::as_str` and `Purpose::parse` give the wire names). The `transcribe` entry is
 [Voxtral Mini 3B](https://huggingface.co/ggml-org/Voxtral-Mini-3B-2507-GGUF)
 (`hw::VOXTRAL_MINI_3B`, Q4_K_M, Apache-2.0), which llama.cpp runs with its audio encoder:
@@ -66,13 +66,59 @@ back as text, so a soundtrack can become text for models without audio.
 `hw::plan` never proposes it, since transcription is optional; `hw::transcriber(&budget)` returns
 it when it fits, and `hw::by_purpose(Purpose::Transcribe)` lists the entries.
 
+## Text to speech
+
+The `speak` role (`Purpose::Speak`) is text in, audio out. Each entry has a `SpeechProfile`
+(`CatalogEntry::speech()`): its preset voices, whether it designs a voice from a description,
+takes style instructions, clones a voice from a reference clip (and whether the clip's
+transcript is used or required), speaks multi-speaker scripts, takes raw engine input or a
+speed, streams; its languages, output formats and sample rate; and its limits. Every field is
+cited to the model's card and its engine's documentation, or absent: nothing is defaulted, and a
+model is never said to do what it doesn't.
+
+| Id | Model | Engine | Does |
+|---|---|---|---|
+| `qwen3-tts-0.6b-customvoice` | [Qwen3-TTS 0.6B CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice) | vLLM-Omni | nine preset voices |
+| `qwen3-tts-0.6b-base` | [Qwen3-TTS 0.6B Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | vLLM-Omni | voice cloning |
+| `qwen3-tts-1.7b-customvoice` | [Qwen3-TTS 1.7B CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | vLLM-Omni | nine preset voices, style instructions |
+| `qwen3-tts-1.7b-voicedesign` | [Qwen3-TTS 1.7B VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) | vLLM-Omni | a voice from a description |
+| `qwen3-tts-1.7b-base` | [Qwen3-TTS 1.7B Base GGUF](https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF) | llama.cpp | voice cloning |
+| `kokoro-82m` | [Kokoro 82M GGUF](https://huggingface.co/ggml-org/Kokoro-82M-GGUF) | llama.cpp | 54 preset voices, phonemes, speed |
+| `voxcpm2` | [VoxCPM2 GGUF](https://huggingface.co/ggml-org/VoxCPM2-GGUF) | llama.cpp | voice design and cloning, 30 languages |
+| `fish-audio-drama-3` | [Fish Audio Drama 3 GGUF](https://huggingface.co/ggml-org/drama-3-GGUF) | llama.cpp | scripts of up to 16 speakers |
+
+GGUF entries (`CatalogEntry::is_gguf`) pin the model and its projector (`CatalogEntry::projector`,
+the codec and voices), both counted in `footprint`. The others name the Hugging Face repo
+vLLM-Omni serves and pin its main weights for sizing.
+
+Fish Audio Drama 3 is under the [Fish Audio Community License](https://huggingface.co/fishaudio/drama-3/blob/main/LICENSE)
+(`speech::FISH_AUDIO_COMMUNITY`): `CatalogEntry::restricted()` is true, `hw::speaker` never
+picks it, and `download` refuses its files (by id, or from its repos under any id) unless the
+consent also accepts the license:
+
+```rust
+use weirdnet_model::{Consent, download, hw, speech::FISH_AUDIO_COMMUNITY};
+
+let drama = hw::find(hw::FISH_AUDIO_DRAMA_3).unwrap();
+let consent = Consent::given(&drama.spec).accepting_license(FISH_AUDIO_COMMUNITY);
+```
+
+`hw::plan` never proposes a speaker; `hw::speaker(&budget)` returns the largest unrestricted GGUF
+one that fits, and `hw::by_purpose(Purpose::Speak)` lists them. A hand-placed GGUF speech model
+gets its profile from its headers: `speech::from_gguf(model, projector)` (Qwen3-TTS, Kokoro with
+the voices stored in its projector, VoxCPM2, Drama 3, as llama.cpp documents them), which
+`limits::measure` puts in `LimitsRecord::speech` so it is kept with the model's limits. With the
+`agent` feature `SpeechProfile` converts to and from `weirdnet_agent::speech::SpeechProfile`, with
+the same form on the wire.
+
 ## Model limits
 
 A client fitting images, audio or a video's frames to a model needs that model's limits, and
 there are no defaults: what isn't known stays absent. `ModelLimits` holds the context the model
 runs with on the node, images per request, what an image costs (a fixed number, or one token per
 `image_patch` pixels square up to `image_tokens`), the longest image edge, audio length and cost
-(per minute, and per piece for encoders that work on 30-second pieces), video length and bytes,
+(per minute, and per piece for encoders that work on 30-second pieces), video length, bytes and
+frames per minute,
 and the largest request. `or` puts an operator's settings over measured ones, `tightest` merges
 copies, and `image_cost` and `audio_cost` price one input. With the `agent` feature it converts
 to and from `weirdnet_agent::MediaLimits` for catalog entries.

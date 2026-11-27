@@ -24,6 +24,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::gguf::{GgufKind, ProjectorInfo};
+use crate::speech::SpeechProfile;
 use crate::{Error, Result};
 
 /// [`LimitsRecord::format`].
@@ -83,6 +84,10 @@ pub struct ModelLimits {
     /// Largest video the model takes whole, in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_max_bytes: Option<u64>,
+    /// Most frames the model reads from one minute of video sent whole (120 for 2 a second),
+    /// kept per minute so the type stays `Eq`. Since 0.5.5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_frames_per_minute: Option<u32>,
     /// Largest request body in bytes the serving side accepts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_request_bytes: Option<u64>,
@@ -102,6 +107,7 @@ impl ModelLimits {
         audio_chunk_tokens: None,
         video_max_seconds: None,
         video_max_bytes: None,
+        video_frames_per_minute: None,
         max_request_bytes: None,
     };
 
@@ -172,6 +178,17 @@ impl ModelLimits {
         self
     }
 
+    /// The model reads at most `frames` frames per minute of video (120 for 2 a second).
+    pub fn with_video_frames_per_minute(mut self, frames: u32) -> Self {
+        self.video_frames_per_minute = Some(frames);
+        self
+    }
+
+    /// [`video_frames_per_minute`](Self::video_frames_per_minute) per second.
+    pub fn video_frame_rate(&self) -> Option<f64> {
+        self.video_frames_per_minute.map(|f| f64::from(f) / 60.0)
+    }
+
     pub fn with_max_request_bytes(mut self, bytes: u64) -> Self {
         self.max_request_bytes = Some(bytes);
         self
@@ -233,12 +250,13 @@ impl ModelLimits {
             audio_chunk_tokens: self.audio_chunk_tokens.or(fallback.audio_chunk_tokens),
             video_max_seconds: self.video_max_seconds.or(fallback.video_max_seconds),
             video_max_bytes: self.video_max_bytes.or(fallback.video_max_bytes),
+            video_frames_per_minute: self.video_frames_per_minute.or(fallback.video_frames_per_minute),
             max_request_bytes: self.max_request_bytes.or(fallback.max_request_bytes),
         }
     }
 
     /// The stricter of two copies, field by field: less context, fewer images, a smaller edge,
-    /// shorter audio and video, fewer request bytes, a smaller patch and higher token costs. A
+    /// shorter audio and video, fewer video frames per minute, fewer request bytes, a smaller patch and higher token costs. A
     /// field known on one side only keeps that side's value; a field neither side knows stays
     /// absent.
     pub fn tightest(self, other: Self) -> Self {
@@ -260,6 +278,7 @@ impl ModelLimits {
             audio_chunk_tokens: pick(self.audio_chunk_tokens, other.audio_chunk_tokens, Ord::max),
             video_max_seconds: pick(self.video_max_seconds, other.video_max_seconds, Ord::min),
             video_max_bytes: pick(self.video_max_bytes, other.video_max_bytes, Ord::min),
+            video_frames_per_minute: pick(self.video_frames_per_minute, other.video_frames_per_minute, Ord::min),
             max_request_bytes: pick(self.max_request_bytes, other.max_request_bytes, Ord::min),
         }
     }
@@ -268,8 +287,9 @@ impl ModelLimits {
 #[cfg(feature = "agent")]
 impl ModelLimits {
     /// The fields `weirdnet_agent::MediaLimits` carries (catalog entries and capability
-    /// records); the context goes in the catalog entry's own `context`, and the audio piece
-    /// size and video fields are left out until the agent's type has them.
+    /// records), video included (since 0.5.5, `weirdnet-agent` 0.5.10); the context goes in the
+    /// catalog entry's own `context`, and the audio piece size is left out (the agent's type
+    /// carries the per-minute rate).
     pub fn to_media(&self) -> weirdnet_agent::MediaLimits {
         let mut m = weirdnet_agent::MediaLimits::new();
         m.max_images = self.max_images;
@@ -278,6 +298,9 @@ impl ModelLimits {
         m.image_edge = self.image_edge;
         m.audio_max_seconds = self.audio_max_seconds;
         m.audio_tokens_per_minute = self.audio_tokens_per_minute;
+        m.video_max_seconds = self.video_max_seconds;
+        m.video_max_bytes = self.video_max_bytes;
+        m.video_frames_per_minute = self.video_frames_per_minute;
         m.max_request_bytes = self.max_request_bytes;
         m
     }
@@ -291,6 +314,9 @@ impl ModelLimits {
             image_edge: m.image_edge,
             audio_max_seconds: m.audio_max_seconds,
             audio_tokens_per_minute: m.audio_tokens_per_minute,
+            video_max_seconds: m.video_max_seconds,
+            video_max_bytes: m.video_max_bytes,
+            video_frames_per_minute: m.video_frames_per_minute,
             max_request_bytes: m.max_request_bytes,
             ..Self::UNKNOWN
         }
@@ -421,6 +447,12 @@ pub struct LimitsRecord {
     /// When it was recorded, in seconds since the Unix epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_at: Option<u64>,
+    /// What a speech model does ([`Purpose::Speak`](crate::hw::Purpose::Speak)): from the
+    /// headers at load ([`measure`], [`speech::from_gguf`](crate::speech::from_gguf)) or what
+    /// the engine reported, kept with the limits. `None` for models that don't speak, and in
+    /// records from before 0.5.5. Since 0.5.5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech: Option<SpeechProfile>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -442,12 +474,20 @@ impl LimitsRecord {
             trained_context: None,
             model_bytes: None,
             recorded_at: None,
+            speech: None,
             extra: Default::default(),
         }
     }
 
     pub fn with_engine(mut self, engine: impl Into<String>) -> Self {
         self.engine = Some(engine.into());
+        self
+    }
+
+    /// Sets the speech profile ([`speech`](Self::speech)), such as what the engine reported
+    /// over what [`measure`] read.
+    pub fn with_speech(mut self, speech: SpeechProfile) -> Self {
+        self.speech = Some(speech);
         self
     }
 
@@ -467,7 +507,9 @@ fn header_of(path: &Path) -> Result<crate::gguf::GgufHeader> {
 /// loads them, into a record: what the projector's header says images and audio cost
 /// ([`from_projector`]), the context the node runs the model at (`context_tokens`, per slot;
 /// `None` when the caller doesn't know it, never the trained context) and the trained context
-/// for reference. Fails when `model` is not a GGUF model or `projector` not a projector.
+/// for reference. A speech model's projector also gives its speech profile
+/// ([`LimitsRecord::speech`], see [`speech::from_gguf`](crate::speech::from_gguf)). Fails when
+/// `model` is not a GGUF model or `projector` not a projector.
 pub fn measure(model: &Path, projector: Option<&Path>, context_tokens: Option<u32>) -> Result<LimitsRecord> {
     let m = header_of(model)?;
     if m.kind != GgufKind::Model {
@@ -475,17 +517,20 @@ pub fn measure(model: &Path, projector: Option<&Path>, context_tokens: Option<u3
     }
     let mut limits = ModelLimits::new();
     let mut projector_name = None;
+    let mut speech = None;
     if let Some(path) = projector {
         let p = header_of(path)?;
-        let Some(info) = p.projector.filter(|_| p.kind.is_projector()) else {
+        let Some(info) = p.projector.as_ref().filter(|_| p.kind.is_projector()) else {
             return Err(Error::Model(format!("{} is not a projector", path.display())));
         };
-        limits = from_projector(&info);
+        limits = from_projector(info);
+        speech = crate::speech::from_gguf(&m, &p);
         projector_name = path.file_name().map(|n| n.to_string_lossy().into_owned());
     }
     limits.context_tokens = context_tokens;
     let mut record = LimitsRecord::new(limits, LimitSource::Measured).stamped();
     record.projector = projector_name;
+    record.speech = speech;
     record.trained_context = m.info.and_then(|i| i.context_length);
     Ok(record)
 }
@@ -666,6 +711,32 @@ mod tests {
         assert_eq!(serde_json::to_value(&newer).unwrap()["app"], json!({"x": 1}));
         let empty: LimitsRecord = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, LimitsRecord::default());
+        // A speech profile is kept, and absent from records without one.
+        assert!(serde_json::to_value(&r).unwrap().get("speech").is_none());
+        let spoken = r.clone().with_speech(SpeechProfile::new().with_presets(["af_heart"]).with_sample_rate(24_000));
+        let j = serde_json::to_value(&spoken).unwrap();
+        assert_eq!(j["speech"], json!({"presets": ["af_heart"], "sample_rate": 24000}));
+        assert_eq!(serde_json::from_value::<LimitsRecord>(j).unwrap(), spoken);
+        assert!(empty.speech.is_none());
+    }
+
+    #[test]
+    fn measures_a_speech_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model =
+            write(tmp.path(), "Kokoro-82M-F32.gguf", &header(&[("general.architecture", json!("kokoro")), ("kokoro.context_length", json!(512))]));
+        let mmproj = write(tmp.path(), "mmproj-Kokoro-82M-F16.gguf", &crate::gguf::speech_projector_header("kokoro"));
+        let r = measure(&model, Some(&mmproj), None).unwrap();
+        let s = r.speech.clone().expect("a speech projector gives a profile");
+        assert_eq!(s.presets.as_deref().and_then(|p| p.first()).map(String::as_str), Some("af_heart"));
+        assert!(r.limits.is_unknown(), "a speech projector's encoder prices no audio input");
+        let back: LimitsRecord = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.speech.as_ref(), Some(&s));
+        // Models that don't speak have none.
+        let vox = write(tmp.path(), "v.gguf", &voxtral_model());
+        let vp = write(tmp.path(), "mmproj-v.gguf", &projector_header("voxtral"));
+        assert!(measure(&vox, Some(&vp), None).unwrap().speech.is_none());
+        assert!(measure(&model, None, None).unwrap().speech.is_none());
     }
 
     #[cfg(feature = "agent")]
@@ -678,7 +749,9 @@ mod tests {
             .with_image_edge(896)
             .with_audio_chunks(30, 187)
             .with_max_request_bytes(1 << 20)
-            .with_video_max_seconds(10);
+            .with_video_max_seconds(10)
+            .with_video_max_bytes(50 << 20)
+            .with_video_frames_per_minute(120);
         let m: weirdnet_agent::MediaLimits = l.into();
         assert_eq!(
             m,
@@ -688,9 +761,14 @@ mod tests {
                 .with_image_edge(896)
                 .with_audio_tokens_per_minute(374)
                 .with_max_request_bytes(1 << 20)
+                .with_video_max_seconds(10)
+                .with_video_max_bytes(50 << 20)
+                .with_video_frames_per_minute(120)
         );
+        assert_eq!(m.video_frame_rate(), l.video_frame_rate());
         let back = ModelLimits::from(m);
-        assert_eq!(back, ModelLimits { context_tokens: None, audio_chunk_seconds: None, audio_chunk_tokens: None, video_max_seconds: None, ..l });
+        assert_eq!(back, ModelLimits { context_tokens: None, audio_chunk_seconds: None, audio_chunk_tokens: None, ..l }, "video round-trips");
+        assert_eq!((back.video_max_seconds, back.video_max_bytes, back.video_frames_per_minute), (Some(10), Some(50 << 20), Some(120)));
         assert!(ModelLimits::from(weirdnet_agent::MediaLimits::UNKNOWN).is_unknown());
     }
 }

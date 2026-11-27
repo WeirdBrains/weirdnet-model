@@ -4,18 +4,25 @@
 //!   threads and system memory. Never fails; missing tools mean fewer devices.
 //! - [`budget()`]: the memory models may use (85% of VRAM, or of unified memory after an OS
 //!   reserve), with overrides.
-//! - [`catalog()`] and [`find()`]: a small tiered catalog of chat, embedding and speech-to-text
-//!   ([`Purpose::Transcribe`]) models with their memory footprints; entries are
+//! - [`catalog()`] and [`find()`]: a small tiered catalog of chat, embedding, speech-to-text
+//!   ([`Purpose::Transcribe`]) and text-to-speech ([`Purpose::Speak`], each with its
+//!   [`SpeechProfile`](crate::SpeechProfile)) models with their memory footprints; entries are
 //!   [`ModelSpec`](crate::ModelSpec)s where this crate pins the file (and the projector a model
 //!   needs, [`CatalogEntry::projector`]), so they download through the consent gate.
 //! - [`plan()`]: the main chat model, a stand-in and an embedding model that fit the budget;
-//!   [`transcriber()`]: the speech-to-text model that fits, for apps that want one.
+//!   [`transcriber()`]: the speech-to-text model that fits, and [`speaker()`] a text-to-speech
+//!   model that fits, for apps that want one. [`restricted_license()`]: the license a download
+//!   must accept first.
 
 mod detect;
 mod sizing;
 
 pub use detect::{Accel, Gpu, Hardware, detect, parse_meminfo_total, parse_nvidia_smi};
-pub use sizing::{Budget, CatalogEntry, Plan, Purpose, VOXTRAL_MINI_3B, budget, by_purpose, catalog, find, plan, transcriber};
+pub use sizing::{
+    Budget, CatalogEntry, FISH_AUDIO_DRAMA_3, KOKORO_82M, Plan, Purpose, QWEN3_TTS_0_6B_BASE, QWEN3_TTS_0_6B_CUSTOMVOICE, QWEN3_TTS_1_7B_BASE,
+    QWEN3_TTS_1_7B_CUSTOMVOICE, QWEN3_TTS_1_7B_VOICEDESIGN, VOXCPM2, VOXTRAL_MINI_3B, budget, by_purpose, catalog, find, plan, restricted_license,
+    speaker, transcriber,
+};
 
 /// 1 GiB.
 pub const GIB: u64 = 1 << 30;

@@ -15,21 +15,40 @@ use crate::{Error, Result};
 
 /// The user said yes to downloading this model. [`download`] needs one, so nothing downloads
 /// without an explicit OK. Create it only after showing [`ModelSpec::consent_text`].
+///
+/// A model under a restricting license ([`hw::restricted_license`](crate::hw::restricted_license),
+/// such as Fish Audio Drama 3 under [`FISH_AUDIO_COMMUNITY`](crate::speech::FISH_AUDIO_COMMUNITY))
+/// also needs the operator's explicit acceptance of that license:
+/// [`accepting_license`](Self::accepting_license).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Consent {
     id: String,
     adapter: bool,
+    license: Option<String>,
 }
 
 impl Consent {
     pub fn given(spec: &ModelSpec) -> Self {
-        Self { id: spec.id.clone(), adapter: false }
+        Self { id: spec.id.clone(), adapter: false, license: None }
     }
 
     /// The user said yes to downloading this adapter ([`download_adapter`]). It doesn't cover a
     /// model of the same id, nor the other way round.
     pub fn given_adapter(adapter: &RepoAdapter) -> Self {
-        Self { id: adapter.id.clone(), adapter: true }
+        Self { id: adapter.id.clone(), adapter: true, license: None }
+    }
+
+    /// The operator explicitly accepted `license` (by name, such as `fish-audio-community`, as
+    /// with Ymir's `--accept-license fish-audio-community`), which a restricted model's download
+    /// needs. Ask for it only after showing the license; it covers that license only. Since 0.5.5.
+    pub fn accepting_license(mut self, license: impl Into<String>) -> Self {
+        self.license = Some(license.into());
+        self
+    }
+
+    /// Whether this consent accepts `license`.
+    pub fn accepts_license(&self, license: &str) -> bool {
+        self.license.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(license))
     }
 }
 
@@ -52,6 +71,14 @@ impl Progress {
 pub fn download(store: &ModelStore, spec: &ModelSpec, consent: &Consent, progress: &mut dyn FnMut(Progress) -> bool) -> Result<PathBuf> {
     if consent.adapter || consent.id != spec.id {
         return Err(Error::Consent);
+    }
+    if let Some(license) = crate::hw::restricted_license(spec)
+        && !consent.accepts_license(license)
+    {
+        return Err(Error::Model(format!(
+            "{} is under the {license} license, which restricts how it may be used; download it only after the operator accepts that license explicitly",
+            spec.id
+        )));
     }
     check_file(&spec.file)?;
     let file = File { url: spec.url(store.hub()), repo: &spec.repo, name: &spec.file, size: spec.size, sha256: spec.sha256.as_deref() };
@@ -422,5 +449,28 @@ mod tests {
         let err = download(&store, &spec, &Consent::given(&spec), &mut |_| true).unwrap_err();
         assert!(matches!(err, Error::Incomplete { .. }), "{err}");
         assert_eq!(store.partial_bytes(&spec), 1000);
+    }
+
+    #[test]
+    fn a_restricted_license_needs_explicit_acceptance() {
+        let b = body();
+        let mut spec = spec_for(&b);
+        spec.id = "my-drama".into();
+        spec.repo = "ggml-org/drama-3-GGUF".into();
+        let hub = MockHub::start("/ggml-org/drama-3-GGUF/resolve/main/t.gguf", b.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(tmp.path()).with_hub(hub.url());
+        for consent in [Consent::given(&spec), Consent::given(&spec).accepting_license("apache-2.0")] {
+            let err = download(&store, &spec, &consent, &mut |_| true).unwrap_err();
+            assert!(err.to_string().contains("fish-audio-community"), "{err}");
+        }
+        assert_eq!(hub.requests(), 0, "refused before any request");
+        let consent = Consent::given(&spec).accepting_license("Fish-Audio-Community");
+        assert!(consent.accepts_license(crate::speech::FISH_AUDIO_COMMUNITY));
+        let path = download(&store, &spec, &consent, &mut |_| true).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b);
+        // Other models need no acceptance.
+        let free = spec_for(&b);
+        assert!(!Consent::given(&free).accepts_license("fish-audio-community"));
     }
 }

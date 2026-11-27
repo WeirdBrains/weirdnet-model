@@ -93,6 +93,14 @@ pub struct GgufHeader {
     /// What a projector takes (`clip.*` keys); `None` for models and adapters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projector: Option<ProjectorInfo>,
+    /// `general.languages`, such as `["en", "zh"]` (speech models list the languages they speak).
+    /// Empty when the header has none. Since 0.5.5.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
+    /// `general.license` (an SPDX id such as `apache-2.0`), or `general.license.name` when that is
+    /// `other`. Since 0.5.5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
 }
 
 /// What a multimodal projector's header (llama.cpp `mtmd`, the `clip.*` keys) says about the
@@ -136,6 +144,28 @@ pub struct ProjectorInfo {
     /// `clip.audio.num_mel_bins`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_mel_bins: Option<u32>,
+    /// `clip.has_gen_audio_encoder`: the model generates audio (a text-to-speech model's
+    /// projector, llama.cpp `docs/multimodal/tts.md`). On such a projector,
+    /// [`audio`](Self::audio) is the encoder for a voice-cloning reference clip, not audio input.
+    /// Since 0.5.5.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub speech: bool,
+    /// The audio generator type (`clip.gen.audio.projector_type`), such as `qwen3tts_gen`,
+    /// `kokoro`, `voxcpm2_gen` or `drama3_gen`. Since 0.5.5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_projector: Option<String>,
+    /// `clip.gen.audio.default_voice`: the preset voice used when a request names none. Since
+    /// 0.5.5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_voice: Option<String>,
+    /// The preset voices stored in a speech projector (its `voice.<name>` tensors, in file
+    /// order); empty when it has none or the tensor table couldn't be read. Since 0.5.5.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub voices: Vec<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl ProjectorInfo {
@@ -149,6 +179,17 @@ impl ProjectorInfo {
     pub fn audio_type(&self) -> Option<&str> {
         self.audio.then_some(self.audio_projector.as_deref()).flatten()
     }
+
+    /// The audio generator type, when the projector generates audio ([`speech`](Self::speech)).
+    pub fn speech_type(&self) -> Option<&str> {
+        self.speech.then_some(self.speech_projector.as_deref()).flatten()
+    }
+
+    /// The model takes audio input (an audio encoder on a projector that doesn't generate speech;
+    /// a speech projector's encoder takes a voice reference instead).
+    pub fn reads_audio(&self) -> bool {
+        self.audio && !self.speech
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +198,7 @@ enum Val {
     Float(f64),
     Str(String),
     Ints(Vec<u64>),
+    Strs(Vec<String>),
     Other,
 }
 
@@ -238,11 +280,23 @@ impl<R: Read> Reader<R> {
                 let et = self.u32()?;
                 let n = self.u64()?;
                 if et == 8 {
+                    // Short lists of short strings (`general.languages`, `general.tags`) are
+                    // kept; vocabularies are skipped.
+                    let mut strs = Vec::new();
+                    let mut keep = n <= SMALL_LIST;
                     for _ in 0..n {
                         let len = self.u64()?;
-                        self.skip(len)?;
+                        if keep && len <= 256 {
+                            match String::from_utf8(self.bytes(len)?) {
+                                Ok(s) => strs.push(s),
+                                Err(_) => keep = false,
+                            }
+                        } else {
+                            keep = false;
+                            self.skip(len)?;
+                        }
                     }
-                    return Ok(Val::Other);
+                    return Ok(if keep { Val::Strs(strs) } else { Val::Other });
                 }
                 let mut ints = Vec::new();
                 for _ in 0..n {
@@ -262,10 +316,17 @@ impl<R: Read> Reader<R> {
 
 type Kv = HashMap<String, Val>;
 
+/// String lists up to this long are read (`general.languages`); longer ones are skipped.
+const SMALL_LIST: u64 = 512;
+
 /// The key-value metadata at the start of a GGUF file (versions 2 and 3), stopping before the
 /// tensor table.
 fn read_kv(r: impl Read) -> Result<Kv> {
-    let mut r = Reader { inner: r, read: 0 };
+    read_kv_from(&mut Reader { inner: r, read: 0 }).map(|(kv, _)| kv)
+}
+
+/// [`read_kv`] on a reader left at the tensor table, with the tensor count.
+fn read_kv_from<R: Read>(r: &mut Reader<R>) -> Result<(Kv, u64)> {
     if r.bytes(4)? != b"GGUF" {
         return Err(Error::Model("not a GGUF file".into()));
     }
@@ -273,7 +334,7 @@ fn read_kv(r: impl Read) -> Result<Kv> {
     if !(2..=3).contains(&version) {
         return Err(Error::Model(format!("GGUF version {version} is not supported")));
     }
-    let _tensors = r.u64()?;
+    let tensors = r.u64()?;
     let count = r.u64()?;
     let mut kv: Kv = HashMap::new();
     for _ in 0..count {
@@ -282,7 +343,29 @@ fn read_kv(r: impl Read) -> Result<Kv> {
         let v = r.value(t)?;
         kv.insert(key, v);
     }
-    Ok(kv)
+    Ok((kv, tensors))
+}
+
+/// The names of `voice.<name>` tensors in the tensor table that follows the metadata (a speech
+/// projector's preset voices), in file order. `None` when the table is cut short or malformed.
+fn voice_tensors<R: Read>(r: &mut Reader<R>, tensors: u64) -> Option<Vec<String>> {
+    let mut voices = Vec::new();
+    for _ in 0..tensors {
+        let name = r.string().ok()?;
+        let dims = r.u32().ok()?;
+        if dims > 8 {
+            return None;
+        }
+        r.skip(u64::from(dims) * 8 + 4 + 8).ok()?;
+        if let Some(v) = name.strip_prefix("voice.")
+            && !v.is_empty()
+            && !v.contains('.')
+            && !voices.iter().any(|x| x == v)
+        {
+            voices.push(v.to_string());
+        }
+    }
+    Some(voices)
 }
 
 fn architecture(kv: &Kv) -> Result<String> {
@@ -337,8 +420,13 @@ pub fn hub_id(url: &str) -> Option<String> {
 /// adapter (`general.type` = `adapter`, with `adapter.type` and `adapter.lora.alpha`) or a
 /// multimodal projector (`general.type` = `mmproj`, or architecture `clip`). Unlike
 /// [`read_info`] it doesn't fail on adapters.
+///
+/// A projector that generates speech ([`ProjectorInfo::speech`]) is read on into its tensor
+/// table for its preset voices ([`ProjectorInfo::voices`]); a table that is cut short (a header
+/// fetched with a `Range` request) leaves them empty.
 pub fn read_header(r: impl Read) -> Result<GgufHeader> {
-    let kv = read_kv(r)?;
+    let mut reader = Reader { inner: r, read: 0 };
+    let (kv, tensors) = read_kv_from(&mut reader)?;
     let architecture = architecture(&kv)?;
     let text = |k: &str| match kv.get(k) {
         Some(Val::Str(s)) if !s.is_empty() => Some(s.clone()),
@@ -360,8 +448,19 @@ pub fn read_header(r: impl Read) -> Result<GgufHeader> {
     let info = if matches!(kind, GgufKind::Model) { info_from(&kv).ok() } else { None };
     let base_model = text("general.base_model.0.repo_url").and_then(|u| hub_id(&u));
     let repo = text("general.source.repo_url").or_else(|| text("general.repo_url")).and_then(|u| hub_id(&u));
-    let projector = kind.is_projector().then(|| projector_from(&kv));
-    Ok(GgufHeader { kind, architecture, base_model, repo, info, projector })
+    let mut projector = kind.is_projector().then(|| projector_from(&kv));
+    if let Some(p) = projector.as_mut().filter(|p| p.speech) {
+        p.voices = voice_tensors(&mut reader, tensors).unwrap_or_default();
+    }
+    let languages = match kv.get("general.languages") {
+        Some(Val::Strs(l)) => l.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        _ => Vec::new(),
+    };
+    let license = match text("general.license") {
+        Some(l) if l.eq_ignore_ascii_case("other") => text("general.license.name").or(Some(l)),
+        l => l,
+    };
+    Ok(GgufHeader { kind, architecture, base_model, repo, info, projector, languages, license })
 }
 
 /// The `clip.*` keys of a projector header.
@@ -390,6 +489,10 @@ fn projector_from(kv: &Kv) -> ProjectorInfo {
         image_max_pixels: int("clip.vision.image_max_pixels"),
         audio_stack_factor: small("clip.audio.projector.stack_factor"),
         audio_mel_bins: small("clip.audio.num_mel_bins"),
+        speech: int("clip.has_gen_audio_encoder").is_some_and(|v| v != 0),
+        speech_projector: text("clip.gen.audio.projector_type"),
+        default_voice: text("clip.gen.audio.default_voice"),
+        voices: Vec::new(),
     }
 }
 
@@ -512,6 +615,65 @@ pub(crate) fn projector_header(which: &str) -> Vec<u8> {
         other => panic!("no test projector {other}"),
     }
     header(&kv)
+}
+
+/// [`header`] followed by a tensor table with these tensor names (1-D, F32), for tests.
+#[cfg(test)]
+pub(crate) fn header_with_tensors(kv: &[(&str, serde_json::Value)], tensors: &[&str]) -> Vec<u8> {
+    let mut out = header(kv);
+    out[8..16].copy_from_slice(&(tensors.len() as u64).to_le_bytes());
+    for t in tensors {
+        out.extend((t.len() as u64).to_le_bytes());
+        out.extend(t.as_bytes());
+        out.extend(1u32.to_le_bytes());
+        out.extend(256u64.to_le_bytes());
+        out.extend(0u32.to_le_bytes());
+        out.extend(0u64.to_le_bytes());
+    }
+    out
+}
+
+/// Speech projector headers with the `clip.*` keys of ggml-org's `mmproj` files (2026-11-27), for
+/// tests: `kokoro` (with three of its voices), `qwen3tts` (Qwen3-TTS 1.7B Base), `voxcpm2`,
+/// `drama3` (no codec encoder, as published) and `drama3-codec` (a conversion with the codec
+/// encoder).
+#[cfg(test)]
+pub(crate) fn speech_projector_header(which: &str) -> Vec<u8> {
+    use serde_json::json;
+    let mut kv = vec![("general.architecture", json!("clip")), ("general.type", json!("mmproj")), ("clip.has_gen_audio_encoder", json!(true))];
+    let mut tensors = vec!["a.gen.wav.dac.0.weight"];
+    match which {
+        "kokoro" => {
+            kv.extend([("clip.gen.audio.projector_type", json!("kokoro")), ("clip.gen.audio.default_voice", json!("af_heart"))]);
+            tensors.extend(["voice.af_alloy", "voice.af_heart", "a.gen.wav.up.0.weight", "voice.bm_george"]);
+        }
+        "qwen3tts" => kv.extend([
+            ("clip.has_audio_encoder", json!(true)),
+            ("clip.audio.projector_type", json!("qwen3tts_spkenc")),
+            ("clip.audio.num_mel_bins", json!(128)),
+            ("clip.gen.audio.projector_type", json!("qwen3tts_gen")),
+        ]),
+        "voxcpm2" => kv.extend([
+            ("general.languages", json!(["zh", "en"])),
+            ("clip.gen.audio.projector_type", json!("voxcpm2_gen")),
+            ("clip.has_audio_encoder", json!(true)),
+            ("clip.audio.projector_type", json!("voxcpm2_spkenc")),
+        ]),
+        "drama3" => kv.extend([
+            ("general.license", json!("other")),
+            ("general.license.name", json!("fish-audio-research-license")),
+            ("clip.gen.audio.projector_type", json!("drama3_gen")),
+        ]),
+        "drama3-codec" => kv.extend([
+            ("general.license", json!("other")),
+            ("general.license.name", json!("fish-audio-research-license")),
+            ("clip.gen.audio.projector_type", json!("drama3_gen")),
+            ("clip.has_audio_encoder", json!(true)),
+            ("clip.audio.projector_type", json!("drama3_codec")),
+        ]),
+        other => panic!("no test speech projector {other}"),
+    }
+    header_with_tensors(&kv, &tensors)
 }
 
 #[cfg(test)]
@@ -637,5 +799,46 @@ mod tests {
         let back: GgufHeader =
             serde_json::from_str(&serde_json::to_string(&read_header(&projector_header("ultravox")[..]).unwrap()).unwrap()).unwrap();
         assert_eq!(back.projector.unwrap().audio_stack_factor, Some(8));
+    }
+
+    #[test]
+    fn speech_projectors_name_their_generator_and_voices() {
+        let h = read_header(&speech_projector_header("kokoro")[..]).unwrap();
+        let p = h.projector.unwrap();
+        assert!(p.speech && !p.audio && !p.reads_audio());
+        assert_eq!((p.speech_type(), p.default_voice.as_deref()), (Some("kokoro"), Some("af_heart")));
+        assert_eq!(p.voices, ["af_alloy", "af_heart", "bm_george"], "voice tensors in file order, nothing else");
+        let q = read_header(&speech_projector_header("qwen3tts")[..]).unwrap().projector.unwrap();
+        assert!(q.speech && q.audio && !q.reads_audio(), "a speech projector's encoder takes a voice reference, not audio input");
+        assert_eq!((q.speech_type(), q.audio_type()), (Some("qwen3tts_gen"), Some("qwen3tts_spkenc")));
+        assert!(q.voices.is_empty());
+        // Input projectors don't speak.
+        let v = read_header(&projector_header("voxtral")[..]).unwrap().projector.unwrap();
+        assert!(!v.speech && v.reads_audio() && v.speech_type().is_none());
+        // A tensor table cut short (a header fetched with a Range request) leaves no voices.
+        let full = speech_projector_header("kokoro");
+        let cut = &full[..full.len() - 30];
+        let p = read_header(cut).unwrap().projector.unwrap();
+        assert!(p.speech && p.voices.is_empty());
+    }
+
+    #[test]
+    fn languages_and_license_from_the_header() {
+        let h = read_header(&speech_projector_header("voxcpm2")[..]).unwrap();
+        assert_eq!(h.languages, ["zh", "en"]);
+        assert_eq!(h.license, None);
+        let d = read_header(&speech_projector_header("drama3")[..]).unwrap();
+        assert_eq!(d.license.as_deref(), Some("fish-audio-research-license"), "`other` names the license");
+        let m = read_header(&header(&[("general.architecture", json!("kokoro")), ("general.license", json!("apache-2.0"))])[..]).unwrap();
+        assert_eq!((m.license.as_deref(), m.languages.len()), (Some("apache-2.0"), 0));
+        // Vocabularies are still skipped, not kept.
+        let many: Vec<_> = (0..600).map(|i| json!(format!("t{i}"))).collect();
+        let big =
+            read_header(&header(&[("general.architecture", json!("llama")), ("general.languages", serde_json::Value::Array(many))])[..]).unwrap();
+        assert!(big.languages.is_empty());
+        // Records from before these fields still read.
+        let old = json!({"kind": "model", "architecture": "llama", "base_model": null, "repo": null, "info": null});
+        let back: GgufHeader = serde_json::from_value(old).unwrap();
+        assert!(back.languages.is_empty() && back.license.is_none());
     }
 }

@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- Text to speech: `Purpose::Speak` (the `speak` role); catalog entries `qwen3-tts-0.6b-customvoice`, `qwen3-tts-0.6b-base`, `qwen3-tts-1.7b-customvoice`, `qwen3-tts-1.7b-voicedesign` (Qwen repos for vLLM-Omni), `qwen3-tts-1.7b-base`, `kokoro-82m`, `voxcpm2` and `fish-audio-drama-3` (ggml-org GGUFs with pinned projectors), with `hw` constants; `hw::speaker`; `CatalogEntry::speaks`, `speech`, `license`, `restricted` and `is_gguf`.
+- `speech`: `SpeechProfile`, `AudioFormat` and `CloneMode` (the wire form of `weirdnet_agent::speech`, with `From` both ways under `agent`), `SpeechProfile::or`, `from_gguf` for hand-placed GGUF speech models, `restricting_license` and `FISH_AUDIO_COMMUNITY`.
+- Restricted licenses: `hw::restricted_license`, `Consent::accepting_license` and `accepts_license`; `download` refuses Fish Audio Drama 3's files without the license accepted.
+- `LimitsRecord::speech` and `with_speech`, filled by `limits::measure` for speech models.
+- `gguf`: `GgufHeader::languages` and `license`; `ProjectorInfo::speech`, `speech_projector`, `default_voice`, `voices` (read from a speech projector's tensor table), `speech_type` and `reads_audio`.
+- `ModelLimits::video_frames_per_minute`, `with_video_frames_per_minute` and `video_frame_rate`.
+
+### Changed
+
+- With `agent`, `ModelLimits::to_media` and `from_media` carry the video fields (`video_max_seconds`, `video_max_bytes`, `video_frames_per_minute`).
+- The `agent` feature needs `weirdnet-agent` 0.5.11.
+
 ## [0.5.4] - 2026-11-26
 
 ### Added

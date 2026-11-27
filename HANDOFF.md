@@ -2,6 +2,22 @@
 
 Running log for [weirdnet-model](https://github.com/WeirdBrains/weirdnet-model), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-27: text to speech: Purpose::Speak, speech catalog and profiles
+
+What changed (on main, for release 0.5.5; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`), the `weirdnet-model` part of Ymir's audio design (`docs/design/audio.md`, "Weirdnet crate spec", on Ymir's `audio-tts-design` branch), requested for Michael:
+
+- `hw::Purpose::Speak` (`speak` on the wire, `Purpose::ALL`). Eight catalog entries with memory footprints: `qwen3-tts-0.6b-customvoice`, `qwen3-tts-0.6b-base`, `qwen3-tts-1.7b-customvoice` and `qwen3-tts-1.7b-voicedesign` (the Qwen repos vLLM-Omni serves; the shared speech tokenizer counts in `footprint`), and `qwen3-tts-1.7b-base`, `kokoro-82m`, `voxcpm2` and `fish-audio-drama-3` (ggml-org GGUFs with their pinned projectors). Sizes and SHA-256 from the Hugging Face API (2026-11-27). `hw::speaker` (largest unrestricted GGUF speaker that fits; `hw::plan` never proposes one), `CatalogEntry::speaks`, `speech`, `license`, `restricted`, `is_gguf`.
+- `speech`: `SpeechProfile`, `AudioFormat`, `CloneMode` with the same fields and wire form as `weirdnet_agent::speech` (0.5.11), `From` both ways under `agent`, `SpeechProfile::or` (engine report over the catalog). Each catalog profile is cited to the model card and to llama.cpp's `docs/multimodal/tts.md` and llama-server README (GGUF) or vLLM-Omni's speech API (Qwen repos). Notable: ggml-org's Drama 3 projector has no codec encoder, so that entry does not clone ("Voice cloning is not supported yet", its card); ggml-org's Qwen3-TTS 1.7B Base projector has the speaker encoder only, so llama.cpp clones from the clip alone (`CloneMode::Audio`).
+- Drama 3 is under the Fish Audio Community License (`speech::FISH_AUDIO_COMMUNITY`): `restricted`, never picked by `speaker`, and `download` refuses its files (by id, or from `ggml-org/drama-3-GGUF` or `fishaudio/drama-3` under any id) unless the consent carries `Consent::accepting_license("fish-audio-community")`; `hw::restricted_license`.
+- Hand-placed GGUF speech models: `speech::from_gguf(model, projector)` from `clip.has_gen_audio_encoder`, `clip.gen.audio.projector_type` (`qwen3tts_gen`, `kokoro`, `voxcpm2_gen`, `drama3_gen`), the reference encoder, `general.languages`, the license and the projector's `voice.*` tensors. `limits::measure` fills the new `LimitsRecord::speech` so `weirdnet-backends` keeps it with `set_limits_store`. `gguf`: `GgufHeader::languages`, `license`; `ProjectorInfo::speech`, `speech_projector`, `default_voice`, `voices`, `speech_type`, `reads_audio`.
+- `ModelLimits::video_frames_per_minute`; with `agent`, `to_media`/`from_media` now carry `video_max_seconds`, `video_max_bytes` and `video_frames_per_minute` (`weirdnet-agent` 0.5.10). The `agent` feature needs `weirdnet-agent` 0.5.11.
+
+Checks run: `cargo fmt --check`; clippy `-D warnings` with default features, `agent` and `llama,agent`; tests with default features, `--no-default-features`, `agent` and `llama,agent`; `cargo doc -D warnings` with `llama,agent`; `cargo package --locked`; `cargo semver-checks` against 0.5.4 with `agent` and with `llama,agent` (no semver update required). `from_gguf` was run on the published headers of the four ggml-org speech GGUFs and their projectors and matches each catalog profile exactly.
+
+Not tested: no speech model was downloaded or run; the profiles of the vLLM-Omni entries were not checked against a running vLLM-Omni; a Drama 3 projector with the codec encoder (its type name is assumed only through `clip.has_audio_encoder`).
+
+What's left and next: release 0.5.5. Then `weirdnet-backends` 0.4.10 can merge `CatalogEntry::speech` and `LimitsRecord::speech` with what the engine reports at load (`SpeechProfile::or`, then `to_agent()`), and Ymir's download path passes `--accept-license` through `Consent::accepting_license`.
+
 ## 2026-11-26: release 0.5.4
 
 What changed: release `v0.5.4` (tag [v0.5.4](https://github.com/WeirdBrains/weirdnet-model/releases/tag/v0.5.4), the `release: v0.5.4` commit right after this entry). It ships speech to text and measured model limits (`86980ef`, entry below) and CI on macOS and Windows (`5a70d34`) to [crates.io](https://crates.io/crates/weirdnet-model/0.5.4); docs at [docs.rs](https://docs.rs/weirdnet-model/0.5.4).

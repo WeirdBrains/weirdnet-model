@@ -1,11 +1,13 @@
 //! The usable memory budget and which models fit in it.
 
 use crate::ModelSpec;
+use crate::speech::{self, CloneMode, SpeechProfile};
 use serde::{Deserialize, Serialize};
 
 use super::{Accel, GIB, Hardware};
 
-/// What a model is for on a node (its role): `chat`, `embedding` or `transcribe` on the wire.
+/// What a model is for on a node (its role): `chat`, `embedding`, `transcribe` or `speak` on the
+/// wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -15,21 +17,29 @@ pub enum Purpose {
     /// Speech to text: audio in (an `input_audio` part), its transcript out, so a soundtrack can
     /// become text for models that don't take audio. Never picked as a chat model.
     Transcribe,
+    /// Text to speech: text (or a multi-speaker script) in, audio out, in the voices its
+    /// [`SpeechProfile`] lists ([`CatalogEntry::speech`]). Never picked as a chat model, never
+    /// in a [`plan`]. Since 0.5.5.
+    Speak,
 }
 
 impl Purpose {
-    /// The name on the wire and in settings: `chat`, `embedding` or `transcribe`.
+    /// Every purpose, in wire order.
+    pub const ALL: [Purpose; 4] = [Purpose::Chat, Purpose::Embedding, Purpose::Transcribe, Purpose::Speak];
+
+    /// The name on the wire and in settings: `chat`, `embedding`, `transcribe` or `speak`.
     pub fn as_str(&self) -> &'static str {
         match self {
             Purpose::Chat => "chat",
             Purpose::Embedding => "embedding",
             Purpose::Transcribe => "transcribe",
+            Purpose::Speak => "speak",
         }
     }
 
     /// The purpose named `name` (as [`as_str`](Self::as_str) writes it), if any.
     pub fn parse(name: &str) -> Option<Purpose> {
-        [Purpose::Chat, Purpose::Embedding, Purpose::Transcribe].into_iter().find(|p| p.as_str() == name)
+        Purpose::ALL.into_iter().find(|p| p.as_str() == name)
     }
 }
 
@@ -42,6 +52,35 @@ impl std::fmt::Display for Purpose {
 /// The speech-to-text entry ([`Purpose::Transcribe`]): Voxtral Mini 3B, which llama.cpp runs
 /// with its projector ([`CatalogEntry::projector`]).
 pub const VOXTRAL_MINI_3B: &str = "voxtral-mini-3b";
+
+/// Text-to-speech entries ([`Purpose::Speak`]), one per checkpoint (each mode of Qwen3-TTS is
+/// its own checkpoint, so its own id). Since 0.5.5.
+///
+/// Qwen3-TTS 0.6B CustomVoice: nine preset voices, for vLLM-Omni.
+pub const QWEN3_TTS_0_6B_CUSTOMVOICE: &str = "qwen3-tts-0.6b-customvoice";
+/// Qwen3-TTS 0.6B Base: voice cloning, for vLLM-Omni.
+pub const QWEN3_TTS_0_6B_BASE: &str = "qwen3-tts-0.6b-base";
+/// Qwen3-TTS 1.7B CustomVoice: nine preset voices with style instructions, for vLLM-Omni.
+pub const QWEN3_TTS_1_7B_CUSTOMVOICE: &str = "qwen3-tts-1.7b-customvoice";
+/// Qwen3-TTS 1.7B VoiceDesign: a voice from a description, for vLLM-Omni.
+pub const QWEN3_TTS_1_7B_VOICEDESIGN: &str = "qwen3-tts-1.7b-voicedesign";
+/// Qwen3-TTS 1.7B Base: voice cloning, as ggml-org's GGUF with its projector, for llama.cpp.
+pub const QWEN3_TTS_1_7B_BASE: &str = "qwen3-tts-1.7b-base";
+/// Kokoro 82M: 54 preset voices, as ggml-org's GGUF with its projector, for llama.cpp.
+pub const KOKORO_82M: &str = "kokoro-82m";
+/// VoxCPM2: voice design and cloning, as ggml-org's GGUF with its projector, for llama.cpp.
+pub const VOXCPM2: &str = "voxcpm2";
+/// Fish Audio Drama 3: multi-speaker scripts, as ggml-org's GGUF with its projector, for
+/// llama.cpp. Under the Fish Audio Community License ([`speech::FISH_AUDIO_COMMUNITY`]):
+/// [`CatalogEntry::restricted`], so [`speaker`] never picks it and a download needs the
+/// operator's explicit acceptance ([`Consent::accepting_license`](crate::Consent::accepting_license)).
+pub const FISH_AUDIO_DRAMA_3: &str = "fish-audio-drama-3";
+
+/// Bytes of Qwen3-TTS's speech tokenizer (`speech_tokenizer/model.safetensors`, the same file in
+/// every Qwen3-TTS repo), which vLLM-Omni loads next to the checkpoint.
+const QWEN3_TTS_TOKENIZER_BYTES: u64 = 682_293_092;
+/// Where Drama 3's weights come from, for the license check on hand-built specs.
+const DRAMA_3_UPSTREAM: &str = "fishaudio/drama-3";
 
 /// A catalog model with what it needs in memory.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,16 +102,127 @@ impl CatalogEntry {
         &self.spec.id
     }
 
-    /// Weights (and the projector's, for entries that need one) plus KV for `slots` concurrent
-    /// requests at the entry's context, plus 10% for compute buffers.
+    /// Weights (and the projector's, for entries that need one, and Qwen3-TTS's speech tokenizer
+    /// for its vLLM-Omni checkpoints) plus KV for `slots` concurrent requests at the entry's
+    /// context, plus 10% for compute buffers.
     pub fn footprint(&self, slots: u32) -> u64 {
         let kv = self.kv_bytes_per_token * self.context as u64 * slots as u64;
-        let weights = self.spec.size + self.projector().map_or(0, |p| p.size);
+        let weights = self.spec.size + self.projector().map_or(0, |p| p.size) + self.companion_bytes();
         (weights + kv) + (weights + kv) / 10
     }
 
-    /// The multimodal projector (llama.cpp `--mmproj`) the entry needs to take its input, pinned
-    /// like the model file: the audio encoder for [`VOXTRAL_MINI_3B`]. `None` for text models.
+    fn companion_bytes(&self) -> u64 {
+        match self.spec.id.as_str() {
+            QWEN3_TTS_0_6B_CUSTOMVOICE | QWEN3_TTS_0_6B_BASE | QWEN3_TTS_1_7B_CUSTOMVOICE | QWEN3_TTS_1_7B_VOICEDESIGN => QWEN3_TTS_TOKENIZER_BYTES,
+            _ => 0,
+        }
+    }
+
+    /// Whether the entry is a GGUF file llama.cpp runs (with its [`projector`](Self::projector)
+    /// when it has one). The others are Hugging Face checkpoints for vLLM-Omni: `spec.repo` is the
+    /// repo the engine serves, and `spec.file`, `size` and `sha256` pin its main weights (the
+    /// engine fetches the rest of the repo). Since 0.5.5.
+    pub fn is_gguf(&self) -> bool {
+        self.spec.file.to_ascii_lowercase().ends_with(".gguf")
+    }
+
+    /// Whether this is a text-to-speech model ([`Purpose::Speak`]). Since 0.5.5.
+    pub fn speaks(&self) -> bool {
+        self.purpose == Purpose::Speak
+    }
+
+    /// The model's license as its card names it (an SPDX id such as `apache-2.0`, or
+    /// [`speech::FISH_AUDIO_COMMUNITY`]), for the entries that record it: the speech-to-text and
+    /// text-to-speech models. `None` for the others. Since 0.5.5.
+    pub fn license(&self) -> Option<&'static str> {
+        match self.spec.id.as_str() {
+            FISH_AUDIO_DRAMA_3 => Some(speech::FISH_AUDIO_COMMUNITY),
+            VOXTRAL_MINI_3B
+            | QWEN3_TTS_0_6B_CUSTOMVOICE
+            | QWEN3_TTS_0_6B_BASE
+            | QWEN3_TTS_1_7B_CUSTOMVOICE
+            | QWEN3_TTS_1_7B_VOICEDESIGN
+            | QWEN3_TTS_1_7B_BASE
+            | KOKORO_82M
+            | VOXCPM2 => Some("apache-2.0"),
+            _ => None,
+        }
+    }
+
+    /// Whether the license restricts use ([`speech::restricting_license`]): such an entry is never
+    /// picked by [`speaker`] or a [`plan`], and [`download`](crate::download()) refuses it (and its
+    /// projector) without a [`Consent::accepting_license`](crate::Consent::accepting_license) for
+    /// that license. Since 0.5.5.
+    pub fn restricted(&self) -> bool {
+        speech::restricting_license(self.license()).is_some()
+    }
+
+    /// What a text-to-speech entry does, cited to the model's card and its engine's documentation
+    /// (llama.cpp `docs/multimodal/tts.md` and the llama-server README for GGUF entries; the
+    /// vLLM-Omni speech API for the others), read 2026-11-27. Never measured figures: what an
+    /// engine reports at load goes over it ([`SpeechProfile::or`]). `None` for entries that
+    /// don't speak. Since 0.5.5.
+    ///
+    /// - Qwen3-TTS (24 kHz, ten languages): CustomVoice has nine preset voices (the 1.7B also
+    ///   takes style instructions; the 0.6B doesn't), VoiceDesign designs a voice from a
+    ///   description, Base clones a voice from a clip whose transcript is optional on vLLM-Omni;
+    ///   ggml-org's 1.7B Base projector has the speaker encoder only, so llama.cpp clones from
+    ///   the clip alone.
+    /// - Kokoro (24 kHz): the 54 voices in ggml-org's projector, `af_heart` (the default) first;
+    ///   English from text (`en-us`, `en-gb`), other languages as raw phonemes; speed.
+    /// - VoxCPM2 (48 kHz, 30 languages from the text): voice design, cloning from a clip (its
+    ///   first 30 s; no transcript).
+    /// - Fish Audio Drama 3 (44.1 kHz, 83 languages from the text): scripts of up to 16
+    ///   speakers. ggml-org's projector has no codec encoder, so it does not clone ("Voice
+    ///   cloning is not supported yet", its card). License [`speech::FISH_AUDIO_COMMUNITY`].
+    pub fn speech(&self) -> Option<SpeechProfile> {
+        if !self.speaks() {
+            return None;
+        }
+        let qwen_vllm = || speech::vllm_omni().with_languages(speech::QWEN3_TTS_LANGUAGES).with_sample_rate(24_000);
+        Some(match self.spec.id.as_str() {
+            QWEN3_TTS_0_6B_CUSTOMVOICE => qwen_vllm().with_presets(QWEN3_TTS_SPEAKERS),
+            QWEN3_TTS_1_7B_CUSTOMVOICE => qwen_vllm().with_presets(QWEN3_TTS_SPEAKERS).with_instructions(true),
+            QWEN3_TTS_1_7B_VOICEDESIGN => qwen_vllm().with_design(true),
+            QWEN3_TTS_0_6B_BASE => qwen_vllm().with_clone(CloneMode::AudioAndText),
+            QWEN3_TTS_1_7B_BASE => {
+                speech::llama_server().with_languages(speech::QWEN3_TTS_LANGUAGES).with_sample_rate(24_000).with_clone(CloneMode::Audio)
+            }
+            KOKORO_82M => speech::llama_server()
+                .with_presets(KOKORO_VOICES)
+                .with_languages(speech::KOKORO_LANGUAGES)
+                .with_raw(true)
+                .with_speed(true)
+                .with_sample_rate(24_000),
+            VOXCPM2 => speech::llama_server()
+                .with_design(true)
+                .with_clone(CloneMode::Audio)
+                .with_max_reference_seconds(30)
+                .with_languages(VOXCPM2_LANGUAGES)
+                .with_sample_rate(48_000),
+            FISH_AUDIO_DRAMA_3 => speech::llama_server()
+                .with_script_speakers(16)
+                .with_languages(DRAMA_3_LANGUAGES)
+                .with_sample_rate(44_100)
+                .with_license(speech::FISH_AUDIO_COMMUNITY),
+            _ => return None,
+        })
+    }
+
+    /// Repos whose files fall under this entry's license (its own, and where the weights come
+    /// from), for [`restricted_license`].
+    fn license_repos(&self) -> Vec<&str> {
+        let mut repos = vec![self.spec.repo.as_str()];
+        if self.spec.id == FISH_AUDIO_DRAMA_3 {
+            repos.push(DRAMA_3_UPSTREAM);
+        }
+        repos
+    }
+
+    /// The multimodal projector (llama.cpp `--mmproj`) the entry needs, pinned like the model
+    /// file: the audio encoder for [`VOXTRAL_MINI_3B`], and the audio generator (codec, voices,
+    /// reference encoder) of each GGUF text-to-speech entry. `None` for text models and the
+    /// vLLM-Omni checkpoints.
     /// Download it with the same consent gate as the model.
     pub fn projector(&self) -> Option<ModelSpec> {
         match self.spec.id.as_str() {
@@ -83,6 +233,38 @@ impl CatalogEntry {
                 "mmproj-Voxtral-Mini-3B-2507-Q8_0.gguf",
                 715_714_080,
                 "4f24c4ef3ce929d02ed9d1cfb050ae9a7365f057c0ddec0d489580982ebe0d02",
+            )),
+            QWEN3_TTS_1_7B_BASE => Some(spec(
+                "qwen3-tts-1.7b-base-mmproj",
+                "Qwen3-TTS 1.7B Base speaker encoder and codec (Q8_0)",
+                "ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF",
+                "mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf",
+                446_422_912,
+                "6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2",
+            )),
+            KOKORO_82M => Some(spec(
+                "kokoro-82m-mmproj",
+                "Kokoro 82M decoder and voices (F16)",
+                "ggml-org/Kokoro-82M-GGUF",
+                "mmproj-Kokoro-82M-F16.gguf",
+                208_456_512,
+                "071d20f53b7c5d64b08a24bff5dfb77c2ea0df843a7c6c2356998a735ec6929d",
+            )),
+            VOXCPM2 => Some(spec(
+                "voxcpm2-mmproj",
+                "VoxCPM2 LocDiT and AudioVAE (BF16)",
+                "ggml-org/VoxCPM2-GGUF",
+                "mmproj-VoxCPM2-BF16.gguf",
+                2_007_741_504,
+                "2d0be367461d11e12a8544487491936a8f1d61d70d5313bb25dd50a4693be2ee",
+            )),
+            FISH_AUDIO_DRAMA_3 => Some(spec(
+                "fish-audio-drama-3-mmproj",
+                "Fish Audio Drama 3 codebook tower and codec (BF16)",
+                "ggml-org/drama-3-GGUF",
+                "mmproj-drama-3-BF16.gguf",
+                2_942_644_160,
+                "c29b9c90cf180cf81da39f31f023ba33641d54d7898e5e9be032c4d111ecbced",
             )),
             _ => None,
         }
@@ -103,9 +285,92 @@ fn chat(spec: ModelSpec, quant: &str, params_b: f32, active_params_b: f32, kv_by
     CatalogEntry { spec, purpose: Purpose::Chat, quant: quant.into(), params_b, active_params_b, kv_bytes_per_token, context }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn speaker_entry(spec: ModelSpec, quant: &str, params_b: f32, active_params_b: f32, kv_bytes_per_token: u64, context: u32) -> CatalogEntry {
+    CatalogEntry { spec, purpose: Purpose::Speak, quant: quant.into(), params_b, active_params_b, kv_bytes_per_token, context }
+}
+
+/// Qwen3-TTS CustomVoice's preset speakers (its model card, as `config.json` names them).
+const QWEN3_TTS_SPEAKERS: [&str; 9] = ["vivian", "serena", "uncle_fu", "dylan", "eric", "ryan", "aiden", "ono_anna", "sohee"];
+
+/// Kokoro's voices (`VOICES.md`; all 54 are in ggml-org's projector), the default first. The first
+/// letter is the language: American and British English, Spanish, French, Hindi, Italian,
+/// Japanese, Brazilian Portuguese, Mandarin.
+const KOKORO_VOICES: [&str; 54] = [
+    "af_heart",
+    "af_alloy",
+    "af_aoede",
+    "af_bella",
+    "af_jessica",
+    "af_kore",
+    "af_nicole",
+    "af_nova",
+    "af_river",
+    "af_sarah",
+    "af_sky",
+    "am_adam",
+    "am_echo",
+    "am_eric",
+    "am_fenrir",
+    "am_liam",
+    "am_michael",
+    "am_onyx",
+    "am_puck",
+    "am_santa",
+    "bf_alice",
+    "bf_emma",
+    "bf_isabella",
+    "bf_lily",
+    "bm_daniel",
+    "bm_fable",
+    "bm_george",
+    "bm_lewis",
+    "ef_dora",
+    "em_alex",
+    "em_santa",
+    "ff_siwis",
+    "hf_alpha",
+    "hf_beta",
+    "hm_omega",
+    "hm_psi",
+    "if_sara",
+    "im_nicola",
+    "jf_alpha",
+    "jf_gongitsune",
+    "jf_nezumi",
+    "jf_tebukuro",
+    "jm_kumo",
+    "pf_dora",
+    "pm_alex",
+    "pm_santa",
+    "zf_xiaobei",
+    "zf_xiaoni",
+    "zf_xiaoxiao",
+    "zf_xiaoyi",
+    "zm_yunjian",
+    "zm_yunxi",
+    "zm_yunxia",
+    "zm_yunyang",
+];
+
+/// VoxCPM2's 30 languages (its model card's `language` list).
+const VOXCPM2_LANGUAGES: [&str; 30] = [
+    "zh", "en", "ar", "my", "da", "nl", "fi", "fr", "de", "el", "he", "hi", "id", "it", "ja", "km", "ko", "lo", "ms", "no", "pl", "pt", "ru", "es",
+    "sw", "sv", "tl", "th", "tr", "vi",
+];
+
+/// Drama 3's 83 languages (its model card's `language` list).
+const DRAMA_3_LANGUAGES: [&str; 83] = [
+    "zh", "en", "ja", "ko", "es", "pt", "ar", "ru", "fr", "de", "sv", "it", "tr", "no", "nl", "cy", "eu", "ca", "da", "gl", "ta", "hu", "fi", "pl",
+    "et", "hi", "la", "ur", "th", "vi", "jw", "bn", "yo", "sl", "cs", "sw", "nn", "he", "ms", "uk", "id", "kk", "bg", "lv", "my", "tl", "sk", "ne",
+    "fa", "af", "el", "bo", "hr", "ro", "sn", "mi", "yi", "am", "be", "km", "is", "az", "sd", "br", "sq", "ps", "mn", "ht", "ml", "sr", "sa", "te",
+    "ka", "bs", "pa", "lt", "kn", "si", "hy", "mr", "as", "gu", "fo",
+];
+
 /// The tiered catalog: chat models smallest first, then the embedding model, then the
-/// speech-to-text model. Sizes and SHA-256 from the Hugging Face API (2026-11-19; Voxtral
-/// 2026-11-26); the Gemma 4 files are `weirdnet-model`'s own pinned entries.
+/// speech-to-text model, then the text-to-speech models. Sizes and SHA-256 from the Hugging Face
+/// API (2026-11-19; Voxtral 2026-11-26; text to speech 2026-11-27); the Gemma 4 files are
+/// `weirdnet-model`'s own pinned entries.
 pub fn catalog() -> Vec<CatalogEntry> {
     let gemma = |id: &str| crate::catalog::find(id).expect("weirdnet-model ships Gemma 4");
     vec![
@@ -236,6 +501,144 @@ pub fn catalog() -> Vec<CatalogEntry> {
             kv_bytes_per_token: 122_880,
             context: 16_384,
         },
+        // Text to speech (Apache-2.0 unless noted). KV per token from each config or GGUF header
+        // (layers x KV heads x (key + value dim) x 2 bytes). Speech runs one utterance at a
+        // time, and the context these entries are sized at (4096: a prompt plus minutes of
+        // audio frames; Drama 3's documented cap in llama.cpp) is an assumption for the budget,
+        // not a limit the model reports.
+        //
+        // Qwen3-TTS (Qwen, 12.5 Hz codec): 28 layers x 8 KV heads x (128 + 128) for both sizes.
+        // ggml-org converted only the 1.7B Base checkpoint; the others are the Qwen repos that
+        // vLLM-Omni serves (BF16 safetensors, plus the shared speech tokenizer).
+        speaker_entry(
+            spec(
+                QWEN3_TTS_0_6B_CUSTOMVOICE,
+                "Qwen3-TTS 0.6B CustomVoice (BF16, vLLM-Omni)",
+                "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                "model.safetensors",
+                1_811_626_576,
+                "bc3c7e785eb961179c25450d1acff03f839e0002f2f3a5aeb67b5735c0fa2adb",
+            ),
+            "BF16",
+            0.6,
+            0.6,
+            114_688,
+            4096,
+        ),
+        speaker_entry(
+            spec(
+                QWEN3_TTS_0_6B_BASE,
+                "Qwen3-TTS 0.6B Base, voice cloning (BF16, vLLM-Omni)",
+                "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+                "model.safetensors",
+                1_829_344_272,
+                "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6",
+            ),
+            "BF16",
+            0.6,
+            0.6,
+            114_688,
+            4096,
+        ),
+        speaker_entry(
+            spec(
+                QWEN3_TTS_1_7B_CUSTOMVOICE,
+                "Qwen3-TTS 1.7B CustomVoice (BF16, vLLM-Omni)",
+                "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                "model.safetensors",
+                3_833_402_552,
+                "38b1d5971bdbd982b561cccec982669a53b0537c3cf5e9bd4778ed07bb2f5137",
+            ),
+            "BF16",
+            1.7,
+            1.7,
+            114_688,
+            4096,
+        ),
+        speaker_entry(
+            spec(
+                QWEN3_TTS_1_7B_VOICEDESIGN,
+                "Qwen3-TTS 1.7B VoiceDesign (BF16, vLLM-Omni)",
+                "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+                "model.safetensors",
+                3_833_402_552,
+                "391e8db219f292c515297cdceeb43e4eae67cdde35fa57e79a6a8a532fca0522",
+            ),
+            "BF16",
+            1.7,
+            1.7,
+            114_688,
+            4096,
+        ),
+        speaker_entry(
+            spec(
+                QWEN3_TTS_1_7B_BASE,
+                "Qwen3-TTS 1.7B Base, voice cloning (Q8_0)",
+                "ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF",
+                "Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf",
+                1_847_874_400,
+                "ac7931aeb2e7aad1a6ed6602d353a5679c9d096b18ce8204ac730a8408d572e1",
+            ),
+            "Q8_0",
+            1.7,
+            1.7,
+            114_688,
+            4096,
+        ),
+        // Kokoro 82M (hexgrad): not autoregressive; 12 layers x 12 heads x (64 + 64) over its
+        // 512-phoneme context.
+        speaker_entry(
+            spec(
+                KOKORO_82M,
+                "Kokoro 82M (F32)",
+                "ggml-org/Kokoro-82M-GGUF",
+                "Kokoro-82M-F32.gguf",
+                61_774_240,
+                "be19298184f1a2577eb20e4689f1e2b315cbf474c39e113f192991fef3c85c6e",
+            ),
+            "F32",
+            0.082,
+            0.082,
+            36_864,
+            512,
+        ),
+        // VoxCPM2 (OpenBMB, 2B): MiniCPM4 backbone, 28 layers x 2 KV heads x (128 + 128), plus
+        // the projector's residual LM (12 layers x 2 x (64 + 64)), which keeps one context per
+        // utterance.
+        speaker_entry(
+            spec(
+                VOXCPM2,
+                "VoxCPM2, voice design and cloning (Q8_0)",
+                "ggml-org/VoxCPM2-GGUF",
+                "VoxCPM2-Q8_0.gguf",
+                1_565_764_064,
+                "b09cd3afab454f23922632fd474aa0d5d667e128e8bf36e81e77ec7e71fac64b",
+            ),
+            "Q8_0",
+            2.0,
+            2.0,
+            28_672 + 6_144,
+            4096,
+        ),
+        // Fish Audio Drama 3 (Fish Audio Community License): Qwen3.5-MoE, 35B with 3B active;
+        // 10 of its 40 layers attend (the rest are recurrent), 2 KV heads x (256 + 256), plus
+        // the projector's codebook tower (13 layers x 2 x (128 + 128)), which keeps the whole
+        // sequence, prompt and frames, in its 4096 positions.
+        speaker_entry(
+            spec(
+                FISH_AUDIO_DRAMA_3,
+                "Fish Audio Drama 3, multi-speaker (Q4_K_M)",
+                "ggml-org/drama-3-GGUF",
+                "drama-3-Q4_K_M.gguf",
+                20_556_053_760,
+                "5b727d669a7a555713403b7f6d744402dafd6fd37154f0fe834a5310548a8b34",
+            ),
+            "Q4_K_M",
+            35.0,
+            3.0,
+            20_480 + 13_312,
+            4096,
+        ),
     ]
 }
 
@@ -249,6 +652,34 @@ pub fn by_purpose(purpose: Purpose) -> Vec<CatalogEntry> {
 /// so an app adds it when it wants soundtracks turned into text.
 pub fn transcriber(budget: &Budget) -> Option<CatalogEntry> {
     by_purpose(Purpose::Transcribe).into_iter().filter(|e| e.footprint(1) <= budget.usable_bytes).max_by(|a, b| a.params_b.total_cmp(&b.params_b))
+}
+
+/// A text-to-speech model ([`Purpose::Speak`]) that fits `budget` with one request at a time,
+/// projector included: the largest GGUF entry (llama.cpp runs it, and [`download`](crate::download())
+/// fetches it) whose license doesn't restrict use, if any. [`plan`] never proposes one: speech
+/// is optional, so an app adds it when it wants text read aloud. Since 0.5.5.
+pub fn speaker(budget: &Budget) -> Option<CatalogEntry> {
+    by_purpose(Purpose::Speak)
+        .into_iter()
+        .filter(|e| e.is_gguf() && !e.restricted() && e.footprint(1) <= budget.usable_bytes)
+        .max_by(|a, b| a.params_b.total_cmp(&b.params_b))
+}
+
+/// The license that restricts downloading `spec`, if any: the license of a restricted catalog
+/// entry ([`CatalogEntry::restricted`]) whose model or projector `spec` is (by id), or whose repo
+/// (or the repo its weights come from) `spec` downloads from. [`download`](crate::download())
+/// refuses such a file without [`Consent::accepting_license`](crate::Consent::accepting_license).
+/// Since 0.5.5.
+pub fn restricted_license(spec: &ModelSpec) -> Option<&'static str> {
+    catalog()
+        .into_iter()
+        .filter(CatalogEntry::restricted)
+        .find(|e| {
+            e.spec.id == spec.id
+                || e.projector().is_some_and(|p| p.id == spec.id)
+                || e.license_repos().iter().any(|r| r.eq_ignore_ascii_case(&spec.repo))
+        })
+        .and_then(|e| e.license())
 }
 
 /// The catalog entry with this id.
@@ -371,7 +802,7 @@ mod tests {
     #[test]
     fn transcribe_is_a_purpose_of_its_own() {
         assert_eq!(serde_json::to_string(&Purpose::Transcribe).unwrap(), "\"transcribe\"");
-        for p in [Purpose::Chat, Purpose::Embedding, Purpose::Transcribe] {
+        for p in Purpose::ALL {
             assert_eq!(serde_json::from_str::<Purpose>(&format!("\"{p}\"")).unwrap(), p);
             assert_eq!(Purpose::parse(p.as_str()), Some(p));
         }
@@ -399,7 +830,7 @@ mod tests {
         // The projector counts in the footprint; text models have none.
         let without = (v.spec.size + v.kv_bytes_per_token * 16_384) * 11 / 10;
         assert!(v.footprint(1) > without);
-        assert!(catalog().iter().filter(|e| !e.transcribes()).all(|e| e.projector().is_none()));
+        assert!(catalog().iter().filter(|e| !e.transcribes() && !e.speaks()).all(|e| e.projector().is_none()));
         // Catalog ids stay unique.
         let mut ids: Vec<_> = catalog().iter().map(|e| e.id().to_string()).collect();
         ids.sort();
@@ -413,12 +844,106 @@ mod tests {
             let hw = box_with(gpus, ram);
             let p = plan(&hw, budget(&hw, None, None));
             for e in [&p.main, &p.standin, &p.embedding].into_iter().flatten() {
-                assert!(!e.transcribes(), "{} in a plan", e.id());
+                assert!(!e.transcribes() && !e.speaks(), "{} in a plan", e.id());
             }
         }
         let hw = box_with(Vec::new(), 62);
         assert_eq!(transcriber(&budget(&hw, None, None)).map(|e| e.spec.id), Some(VOXTRAL_MINI_3B.into()));
         assert_eq!(transcriber(&budget(&hw, Some(GIB), None)), None, "too small a budget");
         assert!(by_purpose(Purpose::Embedding).iter().all(|e| e.purpose == Purpose::Embedding));
+    }
+
+    #[test]
+    fn speak_is_a_purpose_of_its_own() {
+        assert_eq!(serde_json::to_string(&Purpose::Speak).unwrap(), "\"speak\"");
+        assert_eq!(Purpose::parse("speak"), Some(Purpose::Speak));
+        assert_eq!(Purpose::Speak.to_string(), "speak");
+        assert_eq!(Purpose::parse("tts"), None);
+    }
+
+    #[test]
+    fn the_catalog_has_cited_speech_models() {
+        let ids: Vec<_> = by_purpose(Purpose::Speak).iter().map(|e| e.id().to_string()).collect();
+        assert_eq!(
+            ids,
+            [
+                QWEN3_TTS_0_6B_CUSTOMVOICE,
+                QWEN3_TTS_0_6B_BASE,
+                QWEN3_TTS_1_7B_CUSTOMVOICE,
+                QWEN3_TTS_1_7B_VOICEDESIGN,
+                QWEN3_TTS_1_7B_BASE,
+                KOKORO_82M,
+                VOXCPM2,
+                FISH_AUDIO_DRAMA_3
+            ]
+        );
+        let hex = |h: &Option<String>| h.as_deref().is_some_and(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()));
+        for e in by_purpose(Purpose::Speak) {
+            assert!(e.speaks() && !e.transcribes());
+            assert!(hex(&e.spec.sha256), "{} pinned", e.id());
+            let s = e.speech().unwrap_or_else(|| panic!("{} has a profile", e.id()));
+            assert!(s.sample_rate.is_some() && !s.formats.is_empty() && s.languages.is_some(), "{}", e.id());
+            assert!(e.license().is_some());
+            if e.is_gguf() {
+                let p = e.projector().unwrap_or_else(|| panic!("{} needs its projector", e.id()));
+                assert!(hex(&p.sha256) && p.file.starts_with("mmproj-") && p.repo == e.spec.repo);
+                assert_eq!(s.formats, [crate::speech::AudioFormat::Wav, crate::speech::AudioFormat::Pcm16], "llama-server's formats");
+                assert!(e.footprint(1) > (e.spec.size + p.size) * 11 / 10);
+            } else {
+                assert!(e.projector().is_none());
+                assert!(e.spec.repo.starts_with("Qwen/") && e.spec.file == "model.safetensors");
+                assert!(e.footprint(1) > (e.spec.size + QWEN3_TTS_TOKENIZER_BYTES) * 11 / 10, "the speech tokenizer counts");
+                assert!(s.formats.len() == 5 && s.speed, "vLLM-Omni's formats and speed");
+            }
+        }
+        // Each Qwen3-TTS checkpoint does one thing.
+        let q = |id| find(id).unwrap().speech().unwrap();
+        assert_eq!(q(QWEN3_TTS_1_7B_CUSTOMVOICE).presets.as_ref().map(Vec::len), Some(9));
+        assert!(q(QWEN3_TTS_1_7B_CUSTOMVOICE).instructions && !q(QWEN3_TTS_0_6B_CUSTOMVOICE).instructions);
+        assert!(q(QWEN3_TTS_1_7B_VOICEDESIGN).design && q(QWEN3_TTS_1_7B_VOICEDESIGN).clone.is_none());
+        assert_eq!(q(QWEN3_TTS_0_6B_BASE).clone, Some(CloneMode::AudioAndText));
+        assert_eq!(q(QWEN3_TTS_1_7B_BASE).clone, Some(CloneMode::Audio), "ggml-org's projector has the speaker encoder only");
+        let k = q(KOKORO_82M);
+        assert_eq!((k.presets.as_ref().map(Vec::len), k.presets.as_ref().and_then(|p| p.first()).map(String::as_str)), (Some(54), Some("af_heart")));
+        assert!(k.raw && k.speed);
+        assert!(q(VOXCPM2).design && q(VOXCPM2).clone == Some(CloneMode::Audio));
+        assert_eq!(q(VOXCPM2).languages.map(|l| l.len()), Some(30));
+        let d = q(FISH_AUDIO_DRAMA_3);
+        assert_eq!((d.script_speakers, d.clone, d.sample_rate), (Some(16), None, Some(44_100)));
+        assert_eq!(d.languages.map(|l| l.len()), Some(83));
+        // Only Drama 3 is restricted, and its profile names the license.
+        let drama = find(FISH_AUDIO_DRAMA_3).unwrap();
+        assert!(drama.restricted() && drama.license() == Some(crate::speech::FISH_AUDIO_COMMUNITY));
+        assert_eq!(d.license.as_deref(), Some(crate::speech::FISH_AUDIO_COMMUNITY));
+        assert_eq!(catalog().iter().filter(|e| e.restricted()).count(), 1);
+        assert!(catalog().iter().filter(|e| !e.speaks()).all(|e| e.speech().is_none()));
+    }
+
+    #[test]
+    fn a_speaker_that_fits_and_never_a_restricted_one() {
+        let b = |usable_bytes| Budget { pool_bytes: usable_bytes, reserve_bytes: 0, usable_bytes };
+        assert_eq!(speaker(&b(128 * GIB)).map(|e| e.spec.id), Some(VOXCPM2.into()), "never Drama 3, however big");
+        assert_eq!(speaker(&b(GIB * 7 / 2)).map(|e| e.spec.id), Some(QWEN3_TTS_1_7B_BASE.into()));
+        assert_eq!(speaker(&b(GIB)).map(|e| e.spec.id), Some(KOKORO_82M.into()));
+        assert_eq!(speaker(&b(100 << 20)), None);
+        assert!(by_purpose(Purpose::Speak).iter().all(|e| e.footprint(1) > 0));
+    }
+
+    #[test]
+    fn downloads_under_a_restricted_license() {
+        let drama = find(FISH_AUDIO_DRAMA_3).unwrap();
+        let lic = Some(crate::speech::FISH_AUDIO_COMMUNITY);
+        assert_eq!(restricted_license(&drama.spec), lic);
+        assert_eq!(restricted_license(&drama.projector().unwrap()), lic);
+        // A hand-built spec from the same repos, under any id.
+        let mut other = drama.spec.clone();
+        other.id = "my-drama".into();
+        other.file = "drama-3-Q8_0.gguf".into();
+        assert_eq!(restricted_license(&other), lic);
+        other.repo = "FishAudio/Drama-3".into();
+        assert_eq!(restricted_license(&other), lic);
+        for e in catalog().iter().filter(|e| e.spec.id != FISH_AUDIO_DRAMA_3) {
+            assert_eq!(restricted_license(&e.spec), None, "{}", e.id());
+        }
     }
 }
