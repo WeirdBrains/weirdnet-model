@@ -2,6 +2,18 @@
 
 Running log for [weirdnet-model](https://github.com/WeirdBrains/weirdnet-model), newest first. Shared rules: the collective `AGENTS.md` and this repo's [AGENTS.md](AGENTS.md).
 
+## 2026-11-27: release 0.5.5
+
+What changed: release `v0.5.5` (tag [v0.5.5](https://github.com/WeirdBrains/weirdnet-model/releases/tag/v0.5.5), the `release: v0.5.5` commit right after this entry). It ships text to speech (`e0dbe7e`, entry below: `Purpose::Speak`, eight speech catalog entries with cited speech profiles, restricted-license downloads, speech detection from GGUF headers, video limits to the agent) to [crates.io](https://crates.io/crates/weirdnet-model/0.5.5); docs at [docs.rs](https://docs.rs/weirdnet-model/0.5.5). The `agent` feature now needs [weirdnet-agent](https://crates.io/crates/weirdnet-agent) 0.5.11.
+
+Release approval: m3talsmith approved patch releases without asking ("Don't ask about publishing").
+
+Checks run: CI green on `e0dbe7e` (Linux check and cpu-dispatch, macOS, Windows); `cargo semver-checks` against 0.5.4 with `agent` and with `llama,agent` (no semver update required); the release script's checks from [release.toml](release.toml) (fmt, clippy `-D warnings` and tests with `llama,agent`, `cargo doc -D warnings`), then `cargo publish`.
+
+Not tested: as in the entry below.
+
+What's left and next: as in the entry below (weirdnet-backends 0.4.10 serving speech and publishing `LimitsRecord::speech`; the site's model page for 0.5.5).
+
 ## 2026-11-27: text to speech: Purpose::Speak, speech catalog and profiles
 
 What changed (on main, for release 0.5.5; see [CHANGELOG.md](CHANGELOG.md) `Unreleased`), the `weirdnet-model` part of Ymir's audio design (`docs/design/audio.md`, "Weirdnet crate spec", on Ymir's `audio-tts-design` branch), requested for Michael:
