@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-11-27
+
 ### Added
 
 - Text to speech: `Purpose::Speak` (the `speak` role); catalog entries `qwen3-tts-0.6b-customvoice`, `qwen3-tts-0.6b-base`, `qwen3-tts-1.7b-customvoice`, `qwen3-tts-1.7b-voicedesign` (Qwen repos for vLLM-Omni), `qwen3-tts-1.7b-base`, `kokoro-82m`, `voxcpm2` and `fish-audio-drama-3` (ggml-org GGUFs with pinned projectors), with `hw` constants; `hw::speaker`; `CatalogEntry::speaks`, `speech`, `license`, `restricted` and `is_gguf`.
